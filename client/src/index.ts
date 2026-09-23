@@ -107,7 +107,62 @@ function deriveProjectId(): string {
   return slug || "default";
 }
 
-const DEFAULT_PROJECT = deriveProjectId();
+const DERIVED_PROJECT = deriveProjectId();
+
+// ---------- scratch folders ----------
+//
+// A session without a project folder runs in a temporary folder named like
+// "scratch-2026-09-22-19fd5b". Its derived id is new for each session, so
+// such a session names its project on its first write. The proxy stores the
+// name as a memory in ALIAS_PROJECT, and a later proxy in the same folder
+// reads it back. The daemon sees only normal reads and writes.
+
+const SCRATCH_ID = /^scratch_\d{4}_\d{2}_\d{2}_[0-9a-f]+$/;
+const ALIAS_PROJECT = "project_aliases";
+const PROJECT_NAME = /^[a-z][a-z0-9]*(_[a-z0-9]+){1,3}$/;
+const MAX_NAME_LENGTH = 40;
+const MAX_NAME_NUMBER = 99;
+const IS_SCRATCH = SCRATCH_ID.test(DERIVED_PROJECT);
+const ALIAS_KEYPATH = `aliases.${DERIVED_PROJECT}`;
+
+const NAME_RULES =
+  "project_name must be 2 to 4 lowercase words joined by underscores " +
+  `(a-z and 0-9 only), at most ${MAX_NAME_LENGTH} characters, and must ` +
+  'not contain "scratch".';
+
+const NAMING_STEPS =
+  "This session runs in a scratch folder, and its project has no name yet. " +
+  "Your first memstate_set or memstate_remember call without project_id " +
+  "must include project_name. To choose the name, start a Haiku subagent " +
+  '(Agent tool, model "haiku"). Give it two or three sentences about the ' +
+  "task of this session, in your own words. Do not give it command names, " +
+  "tool names, file paths, or the names of other projects, and do not list " +
+  "the projects to choose a name. Ask it for one name: 2 to 4 lowercase " +
+  `English words joined by underscores, at most ${MAX_NAME_LENGTH} ` +
+  'characters, no dates, no "scratch". The proxy stores the name and uses ' +
+  "it for every later call from this folder. If another project already " +
+  "uses the name, the proxy adds a number to it.";
+
+// sessionName is the stored name of this scratch folder. It is "" outside a
+// scratch folder, and before the first write names the project.
+let sessionName = "";
+
+function defaultProject(): string {
+  return sessionName || DERIVED_PROJECT;
+}
+
+function errorText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+function validProjectName(name: string): boolean {
+  return (
+    name.length <= MAX_NAME_LENGTH &&
+    PROJECT_NAME.test(name) &&
+    !name.includes("scratch") &&
+    name !== ALIAS_PROJECT
+  );
+}
 
 // ---------- daemon lifecycle ----------
 
@@ -398,6 +453,92 @@ async function getJSON(route: string): Promise<unknown> {
   return parsed;
 }
 
+// loadSessionName reads the stored name of this scratch folder, if any.
+async function loadSessionName(): Promise<void> {
+  if (!IS_SCRATCH) return;
+  try {
+    const res = (await postJSON("/keypaths", {
+      project_id: ALIAS_PROJECT,
+      keypath: ALIAS_KEYPATH,
+      include_content: true,
+    })) as { memories?: { keypath: string; content: string }[] };
+    const hit = res.memories?.find((m) => m.keypath === ALIAS_KEYPATH);
+    sessionName = hit?.content.trim() ?? "";
+  } catch (err) {
+    process.stderr.write(
+      `memstate: cannot read the scratch folder name: ${errorText(err)}\n`
+    );
+  }
+}
+
+// nameInUse reports whether a live or a soft-deleted project has this id.
+// A write to a soft-deleted project revives its old memories.
+async function nameInUse(name: string): Promise<boolean> {
+  const { projects } = (await getJSON("/projects")) as {
+    projects: { id: string }[];
+  };
+  if (projects.some((p) => p.id === name)) return true;
+  try {
+    await getJSON(`/tree?project_id=${encodeURIComponent(name)}`);
+    return false;
+  } catch (err) {
+    if (errorText(err).startsWith("HTTP 409")) return true;
+    throw err;
+  }
+}
+
+// claimName stores a name for this scratch folder. When the name is in use,
+// it takes the first free numbered form: name_2, name_3, and so on.
+async function claimName(requested: string): Promise<string> {
+  let name = requested;
+  for (let n = 2; await nameInUse(name); n++) {
+    if (n > MAX_NAME_NUMBER) throw new Error(`no free name for "${requested}"`);
+    name = `${requested}_${n}`;
+  }
+  await postJSON("/memories/store", {
+    project_id: ALIAS_PROJECT,
+    keypath: ALIAS_KEYPATH,
+    content: name,
+    category: "config",
+    source: `memstate-mcp ${VERSION}`,
+  });
+  return name;
+}
+
+// writeProject returns the project of a set or remember call. In a scratch
+// folder without a name, the call must name the project with project_name.
+async function writeProject(a: Record<string, unknown>): Promise<string> {
+  const requested = a.project_name;
+  if (requested !== undefined) {
+    if (!IS_SCRATCH) {
+      throw new Error("project_name is only for sessions in a scratch folder");
+    }
+    if (sessionName) {
+      if (requested !== sessionName) {
+        throw new Error(
+          `this session already has the name "${sessionName}"; omit project_name`
+        );
+      }
+    } else if (typeof requested !== "string" || !validProjectName(requested)) {
+      throw new Error(NAME_RULES);
+    } else {
+      sessionName = await claimName(requested);
+    }
+  }
+  if (a.project_id) return String(a.project_id);
+  if (IS_SCRATCH && !sessionName) throw new Error(NAMING_STEPS);
+  return defaultProject();
+}
+
+// PROJECT_NAME_PROPERTY is the project_name argument of the write tools.
+const PROJECT_NAME_PROPERTY = {
+  type: "string",
+  description:
+    "Only for a session in a scratch folder: the name of this session's " +
+    "project, given once, on the first write without project_id. The " +
+    "server instructions tell how to choose it.",
+};
+
 const TOOLS: ToolDef[] = [
   {
     name: "memstate_set",
@@ -449,12 +590,13 @@ const TOOLS: ToolDef[] = [
             "subject tags, lowercase snake_case, e.g. [\"auth\", " +
             "\"embeddings\"]. Search matches ANY listed topic.",
         },
+        project_name: PROJECT_NAME_PROPERTY,
       },
       required: ["keypath", "value"],
     },
-    handler: (a) =>
+    handler: async (a) =>
       postJSON("/memories/store", {
-        project_id: a.project_id || DEFAULT_PROJECT,
+        project_id: await writeProject(a),
         keypath: a.keypath,
         content: a.value,
         source: a.source,
@@ -519,14 +661,17 @@ const TOOLS: ToolDef[] = [
             "keypaths, e.g. \"notes\" stores `## Auth` at `notes.auth`. " +
             "Default is none — sections are stored at the top level.",
         },
+        project_name: PROJECT_NAME_PROPERTY,
       },
       required: ["content"],
     },
-    handler: (a) =>
-      postJSON("/memories/remember", {
-        ...a,
-        project_id: a.project_id || DEFAULT_PROJECT,
-      }),
+    handler: async (a) => {
+      // The daemon rejects unknown fields, and project_name is proxy-only.
+      const body: Record<string, unknown> = { ...a };
+      delete body.project_name;
+      body.project_id = await writeProject(a);
+      return postJSON("/memories/remember", body);
+    },
   },
   {
     name: "memstate_get",
@@ -563,7 +708,7 @@ const TOOLS: ToolDef[] = [
       if (a.list_projects) {
         return getJSON("/projects");
       }
-      const pid = String(a.project_id || DEFAULT_PROJECT);
+      const pid = String(a.project_id || defaultProject());
       if (a.keypath) {
         return postJSON("/keypaths", {
           project_id: pid,
@@ -642,7 +787,7 @@ const TOOLS: ToolDef[] = [
     handler: (a) => {
       const { all_projects, ...body } = a;
       if (!all_projects && !body.project_id) {
-        body.project_id = DEFAULT_PROJECT;
+        body.project_id = defaultProject();
       }
       return postJSON("/memories/search", body);
     },
@@ -674,7 +819,7 @@ const TOOLS: ToolDef[] = [
     handler: (a) => {
       const body = { ...a };
       if (body.keypath && !body.project_id) {
-        body.project_id = DEFAULT_PROJECT;
+        body.project_id = defaultProject();
       }
       return postJSON("/memories/history", body);
     },
@@ -707,7 +852,7 @@ const TOOLS: ToolDef[] = [
     handler: (a) =>
       postJSON("/memories/delete", {
         ...a,
-        project_id: a.project_id || DEFAULT_PROJECT,
+        project_id: a.project_id || defaultProject(),
       }),
   },
   {
@@ -725,7 +870,18 @@ const TOOLS: ToolDef[] = [
   },
 ];
 
-const INSTRUCTIONS = `memstate — persistent memory across sessions, scoped per project.
+// instructions renders the server instructions. Call it after
+// loadSessionName, because a scratch folder without a name gets the naming
+// steps first.
+function instructions(): string {
+  const unnamed = IS_SCRATCH && !sessionName;
+  const naming = unnamed ? `${NAMING_STEPS}\n\n` : "";
+  const origin = !IS_SCRATCH
+    ? `"${DERIVED_PROJECT}"\n  (derived from the repo/directory name)`
+    : sessionName
+      ? `"${sessionName}"\n  (the stored name of this scratch folder)`
+      : "not set until the\n  first write names it (see above)";
+  return `${naming}memstate — persistent memory across sessions, scoped per project.
 
 When to use:
 - Task start: memstate_get(project_id=...) to load prior context.
@@ -737,9 +893,8 @@ Writes are versioned: writing an existing keypath supersedes the old value
 and returns it to you, so you see what changed. Deletes keep history.
 
 Conventions — follow these EXACTLY; every deviation fragments the store:
-- project_id: OMIT it. This session's default is "${DEFAULT_PROJECT}"
-  (derived from the repo/directory name) and is used whenever project_id
-  is absent. Only pass project_id to reach a DIFFERENT project, and then
+- project_id: OMIT it. This session's default is ${origin} and is used
+  whenever project_id is absent. Only pass project_id to reach a DIFFERENT project, and then
   only an id that memstate_get(list_projects=true) actually lists — NEVER
   invent a variant: "my-app", "myapp", and "my_app_dev" each create a
   separate, disconnected project.
@@ -766,6 +921,7 @@ Conventions — follow these EXACTLY; every deviation fragments the store:
   "## Section" at the top level — "## Auth" lands at keypath "auth",
   exactly like an explicit write. Pass root="notes" (etc.) only when you
   deliberately want sections nested under a prefix.`;
+}
 
 // ---------- main ----------
 
@@ -793,9 +949,10 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
+  await loadSessionName();
   const server = new Server(
     { name: "memstate", version: VERSION },
-    { capabilities: { tools: {} }, instructions: INSTRUCTIONS }
+    { capabilities: { tools: {} }, instructions: instructions() }
   );
 
   server.setRequestHandler(ListToolsRequestSchema, async () => ({

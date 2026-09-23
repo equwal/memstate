@@ -26,6 +26,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Optional
@@ -192,7 +193,7 @@ def _request(method: str, path: str, body: Optional[dict] = None) -> int:
         return 2
 
 
-def default_project() -> str:
+def derived_project() -> str:
     """Project id derived from the git repo name (or cwd basename outside a
     repo), slugged to lowercase snake_case — same rule as the TS proxy, so
     scripts and MCP sessions land in the same project."""
@@ -210,6 +211,132 @@ def default_project() -> str:
         base = Path.cwd().name
     slug = re.sub(r"[^a-z0-9]+", "_", base.lower()).strip("_")
     return slug or "default"
+
+
+# A session without a project folder runs in a temporary folder named like
+# "scratch-2026-09-22-19fd5b". Its derived id is new for each session, so the
+# first write names the project. The name is stored as a memory in
+# ALIAS_PROJECT, the same record that the TS proxy reads and writes.
+SCRATCH_ID_RE = re.compile(r"scratch_\d{4}_\d{2}_\d{2}_[0-9a-f]+")
+PROJECT_NAME_RE = re.compile(r"[a-z][a-z0-9]*(_[a-z0-9]+){1,3}")
+ALIAS_PROJECT = "project_aliases"
+MAX_NAME_LENGTH = 40
+MAX_NAME_NUMBER = 99
+
+NAME_RULES = (
+    "--project-name must be 2 to 4 lowercase words joined by underscores "
+    f"(a-z and 0-9 only), at most {MAX_NAME_LENGTH} characters, and must "
+    'not contain "scratch".'
+)
+NAMING_STEPS = (
+    "this folder is a scratch folder, and its project has no name yet. "
+    "Pass --project-name NAME on the first write. NAME tells the task in "
+    f"2 to 4 lowercase words joined by underscores, at most {MAX_NAME_LENGTH} "
+    'characters, no dates, no "scratch". The scripts store the name and use '
+    "it for every later call from this folder. If another project already "
+    "uses the name, a number is added to it."
+)
+
+
+def _fetch(method: str, path: str, body: Optional[dict] = None) -> dict:
+    """Send one request and return the parsed JSON. Raises HTTPError."""
+    data = None if body is None else json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(f"{_base()}{path}", data=data,
+                                 headers=_HEADERS, method=method)
+    with urllib.request.urlopen(req) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _is_scratch(pid: str) -> bool:
+    return SCRATCH_ID_RE.fullmatch(pid) is not None
+
+
+def session_name() -> str:
+    """Stored name of this scratch folder, or "" when there is none."""
+    pid = derived_project()
+    if not _is_scratch(pid):
+        return ""
+    keypath = f"aliases.{pid}"
+    try:
+        res = _fetch("POST", "/keypaths", {"project_id": ALIAS_PROJECT,
+                                           "keypath": keypath,
+                                           "include_content": True})
+    except (urllib.error.URLError, ValueError) as e:
+        print(f"Warning: cannot read the scratch folder name: {e}", file=sys.stderr)
+        return ""
+    for m in res.get("memories") or []:
+        if m.get("keypath") == keypath:
+            return str(m.get("content", "")).strip()
+    return ""
+
+
+def default_project() -> str:
+    """The stored name of a scratch folder, else the derived project id."""
+    return session_name() or derived_project()
+
+
+def valid_project_name(name: str) -> bool:
+    return (len(name) <= MAX_NAME_LENGTH
+            and PROJECT_NAME_RE.fullmatch(name) is not None
+            and "scratch" not in name
+            and name != ALIAS_PROJECT)
+
+
+def _name_in_use(name: str) -> bool:
+    """True when a live or a soft-deleted project has this id. A write to a
+    soft-deleted project revives its old memories."""
+    projects = _fetch("GET", "/projects").get("projects") or []
+    if any(p.get("id") == name for p in projects):
+        return True
+    try:
+        _fetch("GET", f"/tree?project_id={urllib.parse.quote(name)}")
+    except urllib.error.HTTPError as e:
+        if e.code == 409:
+            return True
+        raise
+    return False
+
+
+def _claim_name(pid: str, requested: str) -> str:
+    """Store a name for scratch folder pid. A name in use gets the first
+    free numbered form: name_2, name_3, and so on."""
+    name = requested
+    n = 2
+    while _name_in_use(name):
+        if n > MAX_NAME_NUMBER:
+            sys.exit(f'Error: no free name for "{requested}"')
+        name = f"{requested}_{n}"
+        n += 1
+    _fetch("POST", "/memories/store", {"project_id": ALIAS_PROJECT,
+                                       "keypath": f"aliases.{pid}",
+                                       "content": name,
+                                       "category": "config",
+                                       "source": "memstate skill scripts"})
+    return name
+
+
+def write_project(project: Optional[str], project_name: Optional[str]) -> str:
+    """Project of a set or remember call. In a scratch folder without a
+    name, the call must name the project with --project-name."""
+    pid = derived_project()
+    if not _is_scratch(pid):
+        if project_name is not None:
+            sys.exit("Error: --project-name is only for a scratch folder")
+        return project or pid
+    name = session_name()
+    if project_name is not None:
+        if name and project_name != name:
+            sys.exit(f'Error: this folder already has the name "{name}"; '
+                     "omit --project-name")
+        if not name:
+            if not valid_project_name(project_name):
+                sys.exit("Error: " + NAME_RULES)
+            name = _claim_name(pid, project_name)
+    if project:
+        return project
+    if not name:
+        sys.exit("Error: " + NAMING_STEPS)
+    return name
 
 
 def post(path: str, body: dict) -> int:

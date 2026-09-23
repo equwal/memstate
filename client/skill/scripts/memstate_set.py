@@ -3,13 +3,16 @@
 import argparse
 import sys
 
-from _client import default_project, post
+from _client import post, write_project
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Set a single fact at a keypath")
     ap.add_argument("--project", default=None,
                     help="project id (default: derived from repo/dir name)")
+    ap.add_argument("--project-name", default=None,
+                    help="only in a scratch folder: the name of this "
+                         "folder's project, given on the first write")
     ap.add_argument("--keypath", required=True)
     ap.add_argument("--value", required=True)
     ap.add_argument("--source", default=None)
@@ -20,7 +23,7 @@ def main() -> int:
     args = ap.parse_args()
 
     body = {
-        "project_id": args.project or default_project(),
+        "project_id": write_project(args.project, args.project_name),
         "keypath": args.keypath,
         "content": args.value,
     }
