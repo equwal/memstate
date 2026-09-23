@@ -25,6 +25,9 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROXY = path.resolve(__dirname, "..", "dist", "index.js");
+// The proxy derives its default project from its working directory, so the
+// main client runs in the repository: a scratch-named cwd changes behavior.
+const REPO_ROOT = path.resolve(__dirname, "..", "..");
 const PROJECT = "regress_test";
 
 let failures = 0;
@@ -44,6 +47,20 @@ async function call(client, name, args) {
   const text = res.content?.[0]?.text ?? "";
   if (res.isError) return { isError: true, message: text };
   return { isError: false, data: JSON.parse(text) };
+}
+
+// connect starts one more proxy with its working directory at cwd.
+async function connect(env, cwd) {
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [PROXY],
+    env,
+    cwd,
+    stderr: "ignore",
+  });
+  const client = new Client({ name: "regression-test", version: "0.0.0" });
+  await client.connect(transport);
+  return client;
 }
 
 async function main() {
@@ -66,6 +83,7 @@ async function main() {
     command: process.execPath,
     args: [PROXY],
     env,
+    cwd: REPO_ROOT,
     stderr: "ignore",
   });
   const client = new Client({ name: "regression-test", version: "0.0.0" });
@@ -350,6 +368,113 @@ async function main() {
     check("delete_project: any write revives the project with memories intact",
       !r.isError && !tree.isError && tree.data.total_memories > 1,
       JSON.stringify(tree));
+
+    // ---- scratch folder naming ---------------------------------------------
+    // A folder named like "scratch-2026-01-02-abc123" gets its project name
+    // on the first write. The proxy stores the name and reads it back later.
+    const NAME = "regress_naming_task";
+    const scratch = (id) => {
+      const dir = path.join(tmp, `scratch-2026-01-02-${id}`);
+      fs.mkdirSync(dir);
+      return dir;
+    };
+    const dirA = scratch("abc123");
+
+    let sc = await connect(env, dirA);
+    try {
+      const text = sc.getInstructions() ?? "";
+      check("scratch: instructions tell how to name the project",
+        text.includes("project_name") && text.includes("haiku"),
+        text.slice(0, 200));
+
+      r = await call(sc, "memstate_set", { keypath: "notes.first", value: "a" });
+      check("scratch: first write without a name is refused",
+        r.isError && r.message.includes("project_name"),
+        JSON.stringify(r));
+
+      r = await call(sc, "memstate_set", {
+        keypath: "notes.first", value: "a", project_name: "Bad Name",
+      });
+      check("scratch: an invalid name is refused",
+        r.isError && r.message.includes("project_name must be"),
+        JSON.stringify(r));
+
+      r = await call(sc, "memstate_set", {
+        keypath: "notes.first", value: "a", project_name: "scratch_notes_here",
+      });
+      check("scratch: a name that contains scratch is refused",
+        r.isError && r.message.includes("project_name must be"),
+        JSON.stringify(r));
+
+      r = await call(sc, "memstate_set", {
+        keypath: "notes.first", value: "first", project_name: NAME,
+      });
+      check("scratch: project_name names the project on the first write",
+        !r.isError && r.data.stored.project_id === NAME,
+        JSON.stringify(r));
+
+      r = await call(sc, "memstate_remember", {
+        keypath: "notes.second", content: "second",
+      });
+      check("scratch: later writes use the stored name",
+        !r.isError && r.data.items[0].stored.project_id === NAME,
+        JSON.stringify(r));
+
+      r = await call(sc, "memstate_set", {
+        keypath: "notes.third", value: "c", project_name: "other_task_name",
+      });
+      check("scratch: a second, different name is refused",
+        r.isError && r.message.includes(NAME),
+        JSON.stringify(r));
+    } finally {
+      await sc.close();
+    }
+
+    sc = await connect(env, dirA);
+    try {
+      r = await call(sc, "memstate_get", {});
+      check("scratch: a new proxy in the same folder reads the stored name",
+        !r.isError && r.data.project_id === NAME && r.data.total_memories === 2,
+        JSON.stringify(r));
+      check("scratch: a named folder gets no naming steps",
+        !(sc.getInstructions() ?? "").includes("project_name"),
+        "");
+    } finally {
+      await sc.close();
+    }
+
+    sc = await connect(env, scratch("def456"));
+    try {
+      r = await call(sc, "memstate_set", {
+        keypath: "notes.first", value: "b", project_name: NAME,
+      });
+      check("scratch: a name in use gets a number",
+        !r.isError && r.data.stored.project_id === `${NAME}_2`,
+        JSON.stringify(r));
+    } finally {
+      await sc.close();
+    }
+
+    // A soft-deleted project keeps its name: a write would revive its memories.
+    await call(client, "memstate_delete_project", { project_id: `${NAME}_2` });
+    sc = await connect(env, scratch("0a0b0c"));
+    try {
+      r = await call(sc, "memstate_set", {
+        keypath: "notes.first", value: "c", project_name: NAME,
+      });
+      check("scratch: the name of a soft-deleted project counts as in use",
+        !r.isError && r.data.stored.project_id === `${NAME}_3`,
+        JSON.stringify(r));
+    } finally {
+      await sc.close();
+    }
+
+    r = await call(client, "memstate_set", {
+      project_id: PROJECT, keypath: "config.gamma", value: "g", project_name: NAME,
+    });
+    check("scratch: project_name outside a scratch folder is refused",
+      r.isError && r.message.includes("scratch folder"),
+      JSON.stringify(r));
 
     // ---- error path -----------------------------------------------------------
     const bad = await client.callTool({ name: "memstate_set", arguments: {} });

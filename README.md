@@ -113,6 +113,14 @@ from the git repository name (the directory basename outside a
 repository), slugged to snake_case. Omit `project_id` in tool calls.
 Pass it only to reach a different project. Keypaths use dot notation.
 
+A temporary scratch folder (named like `scratch-2026-09-22-19fd5b`) gets a
+new id for each session. There, the first `memstate_set` or
+`memstate_remember` call without `project_id` must pass `project_name`, a
+short snake_case name of the task. The server instructions tell the model to
+choose it with a Haiku subagent. The proxy stores the name in project
+`project_aliases` and uses it for every later call from that folder. A name
+already in use gets a number (`name_2`).
+
 | Tool | Purpose |
 |---|---|
 | `memstate_set` | Write a short value at a keypath (`config.port = "8080"`). |

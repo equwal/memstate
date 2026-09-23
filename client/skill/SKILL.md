@@ -49,6 +49,14 @@ Every deviation fragments the store into disconnected near-duplicates.
   and then only an id that `memstate_get.py --list-projects` lists.
   Never invent a variant. `my-app`, `myapp`, and `my_app_dev` are three
   different projects.
+- **Scratch folders**: A session without a project folder runs in a
+  temporary folder named like `scratch-2026-09-22-19fd5b`. There, the
+  first `memstate_set.py` or `memstate_remember.py` call must pass
+  `--project-name NAME`: 2 to 4 lowercase words joined by underscores that
+  tell the task, at most 40 characters, no dates, no `scratch`. Do not use
+  command names or the names of other projects to choose it. The scripts
+  store the name in project `project_aliases` and use it for every later
+  call from that folder. A name already in use gets a number (`name_2`).
 - **keypath segments**: Lowercase snake_case only (`[a-z0-9_]`), joined
   by dots. Dates are `YYYY_MM_DD` inside a segment:
   `task.summary.2026_07_04`. Never `2026-07-04`, camelCase, or spaces.
