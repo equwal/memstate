@@ -16,7 +16,9 @@
  *
  * Run: node client/test/regression.mjs   (after `make build`)
  */
+import { spawn } from "child_process";
 import * as fs from "fs";
+import * as http from "http";
 import * as os from "os";
 import * as path from "path";
 import { fileURLToPath } from "url";
@@ -487,11 +489,61 @@ async function main() {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 
+  await attachToSlowDaemon();
+
   if (failures > 0) {
     process.stdout.write(`\n${failures} regression check(s) FAILED\n`);
     process.exit(1);
   }
   process.stdout.write("\nall regression checks passed\n");
+}
+
+// attachToSlowDaemon: a daemon on another machine answers /health late,
+// because a new connection costs two round trips. On 2026-09-25 a daemon at
+// 10.66.0.1 over WireGuard (280 ms round trip) took 680 ms, the proxy gave up
+// after 500 ms, and it tried to start its own daemon on an address that was
+// not local. The proxy must wait for the daemon and attach to it. A proxy that
+// starts a daemon writes the daemon log under $HOME, so an empty $HOME shows
+// that none was started.
+async function attachToSlowDaemon() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "memstate-attach-"));
+  const fake = http.createServer((req, res) => {
+    setTimeout(() => {
+      if (req.url === "/health") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ service: "memstate", version: "test", embed_model: "" }));
+      } else {
+        res.writeHead(404);
+        res.end();
+      }
+    }, 800);
+  });
+  await new Promise((resolve) => fake.listen(0, "127.0.0.1", resolve));
+  const addr = `127.0.0.1:${fake.address().port}`;
+  try {
+    const env = { ...process.env, MEMSTATE_ADDR: addr, HOME: home, MEMSTATE_NO_UPDATE_CHECK: "1" };
+    const proxy = spawn(process.execPath, [PROXY, "--test"], {
+      env,
+      cwd: REPO_ROOT,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let out = "";
+    proxy.stdout.on("data", (d) => (out += d));
+    proxy.stderr.on("data", (d) => (out += d));
+    await new Promise((resolve) => proxy.on("exit", resolve));
+    // The exit code is not checked: on Windows, Node can abort in process.exit
+    // while a fetch socket closes (libuv assertion in src\win\async.c), and the
+    // smoke test `--test` shows the same with any daemon.
+    check("attach: a daemon that answers /health slowly is attached",
+      out.includes("mode=attach"),
+      out.trim());
+    check("attach: no second daemon is started for it",
+      !fs.existsSync(path.join(home, ".memstate", "memstated.log")),
+      "the proxy started a daemon");
+  } finally {
+    fake.close();
+    fs.rmSync(home, { recursive: true, force: true });
+  }
 }
 
 main().catch((err) => {
