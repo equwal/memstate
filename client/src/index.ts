@@ -206,10 +206,16 @@ type HealthProbe = "ours" | "alien" | "empty";
 // reported. Empty when the daemon runs without embeddings.
 let daemonEmbedModel = "";
 
+// PROBE_TIMEOUT_MS is how long a /health probe waits. In attach mode the
+// daemon can be on another machine: over WireGuard at a 280 ms round trip, the
+// first /health on a new connection took 680 ms. A closed local port fails at
+// once, so the long wait costs nothing when no daemon listens.
+const PROBE_TIMEOUT_MS = 3000;
+
 async function probeHealth(addr: string): Promise<HealthProbe> {
   try {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 500);
+    const timer = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS);
     const res = await fetch(`http://${addr}/health`, { signal: controller.signal });
     clearTimeout(timer);
     if (!res.ok) return "alien";
