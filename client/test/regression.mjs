@@ -534,6 +534,8 @@ async function main() {
   }
 
   await attachToSlowDaemon();
+  await attachRetriesHealth();
+  await noDaemonForRemoteAddr();
 
   if (failures > 0) {
     process.stdout.write(`\n${failures} regression check(s) FAILED\n`);
@@ -597,18 +599,7 @@ async function attachToSlowDaemon() {
   await new Promise((resolve) => fake.listen(0, "127.0.0.1", resolve));
   const addr = `127.0.0.1:${fake.address().port}`;
   try {
-    const env = { ...process.env, MEMSTATE_ADDR: addr, HOME: home, MEMSTATE_NO_UPDATE_CHECK: "1" };
-    const proxy = spawn(process.execPath, [PROXY, "--test"], {
-      env,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    let out = "";
-    proxy.stdout.on("data", (d) => (out += d));
-    proxy.stderr.on("data", (d) => (out += d));
-    await new Promise((resolve) => proxy.on("exit", resolve));
-    // The exit code is not checked: on Windows, Node can abort in process.exit
-    // while a fetch socket closes (libuv assertion in src\win\async.c), and the
-    // smoke test `--test` shows the same with any daemon.
+    const out = await runProxy(addr, home);
     check("attach: a daemon that answers /health slowly is attached",
       out.includes("mode=attach"),
       out.trim());
@@ -619,6 +610,77 @@ async function attachToSlowDaemon() {
     fake.close();
     fs.rmSync(home, { recursive: true, force: true });
   }
+}
+
+// attachRetriesHealth: on 2026-09-26 the VPS behind 10.66.0.1 dropped most new
+// TCP connections, because its conntrack table was full. One /health probe
+// timed out, and the proxy started its own daemon at once. The proxy must probe
+// again before it gives up. The fake daemon holds the first /health request
+// past the probe timeout, and answers the next request at once.
+async function attachRetriesHealth() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "memstate-retry-"));
+  let requests = 0;
+  const fake = http.createServer((req, res) => {
+    requests++;
+    setTimeout(() => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ service: "memstate", version: "test", embed_model: "" }));
+    }, requests === 1 ? 4000 : 0);
+  });
+  await new Promise((resolve) => fake.listen(0, "127.0.0.1", resolve));
+  const addr = `127.0.0.1:${fake.address().port}`;
+  try {
+    const out = await runProxy(addr, home);
+    check("retry: a daemon that misses one /health probe is attached",
+      out.includes("mode=attach"),
+      out.trim());
+    check("retry: no second daemon is started for it",
+      !fs.existsSync(path.join(home, ".memstate", "memstated.log")),
+      "the proxy started a daemon");
+  } finally {
+    fake.closeAllConnections();
+    fake.close();
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+}
+
+// noDaemonForRemoteAddr: a daemon cannot listen on an address of another
+// machine. On 2026-09-26 the proxy tried to start one on 10.66.0.1:8767 and
+// the daemon failed with "bind: The requested address is not valid in its
+// context". When nothing answers at an IP address that this machine does not
+// have, the proxy must fail with a clear message and start no daemon.
+// 192.0.2.1 is in TEST-NET-1 (RFC 5737), so no machine has it.
+async function noDaemonForRemoteAddr() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "memstate-remote-"));
+  try {
+    const out = await runProxy("192.0.2.1:8767", home);
+    check("remote: the proxy says that it does not start a daemon there",
+      out.includes("not an address of this machine"),
+      out.trim());
+    check("remote: no daemon is started for an address of another machine",
+      !fs.existsSync(path.join(home, ".memstate", "memstated.log")),
+      "the proxy started a daemon");
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+}
+
+// runProxy runs the proxy smoke test (`--test`) with MEMSTATE_ADDR=addr and
+// HOME=home, and returns its stdout and stderr. The exit code is not checked:
+// on Windows, Node can abort in process.exit while a fetch socket closes
+// (libuv assertion in src\win\async.c), and the smoke test `--test` shows the
+// same with any daemon.
+async function runProxy(addr, home) {
+  const env = { ...process.env, MEMSTATE_ADDR: addr, HOME: home, MEMSTATE_NO_UPDATE_CHECK: "1" };
+  const proxy = spawn(process.execPath, [PROXY, "--test"], {
+    env,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let out = "";
+  proxy.stdout.on("data", (d) => (out += d));
+  proxy.stderr.on("data", (d) => (out += d));
+  await new Promise((resolve) => proxy.on("exit", resolve));
+  return out;
 }
 
 main().catch((err) => {

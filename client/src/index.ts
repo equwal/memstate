@@ -19,6 +19,7 @@
  */
 import { spawn, execSync, ChildProcess } from "child_process";
 import * as fs from "fs";
+import * as net from "net";
 import * as os from "os";
 import * as path from "path";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -212,6 +213,31 @@ let daemonEmbedModel = "";
 // once, so the long wait costs nothing when no daemon listens.
 const PROBE_TIMEOUT_MS = 3000;
 
+// PROBE_TRIES is how many /health probes attach mode makes before it decides
+// that no daemon listens. A network that drops packets can make one probe
+// time out. A closed port fails at once, so the extra probes cost nothing
+// when no daemon listens.
+const PROBE_TRIES = 3;
+
+// isRemoteAddr reports whether addr has an IP address that no interface of
+// this machine has. A daemon cannot listen on such an address. The function
+// does not resolve a host name: the daemon does that when it starts.
+function isRemoteAddr(addr: string): boolean {
+  let host: string;
+  try {
+    host = new URL(`http://${addr}`).hostname.replace(/^\[(.*)\]$/, "$1");
+  } catch {
+    return false;
+  }
+  if (net.isIP(host) === 0) return false;
+  if (host.startsWith("127.") || host === "0.0.0.0" || host === "::" || host === "::1") {
+    return false;
+  }
+  return !Object.values(os.networkInterfaces()).some((list) =>
+    list?.some((i) => i.address === host)
+  );
+}
+
 async function probeHealth(addr: string): Promise<HealthProbe> {
   try {
     const controller = new AbortController();
@@ -302,10 +328,21 @@ function awaitBanner(
 }
 
 async function attach(addr: string): Promise<void> {
-  const probe = await probeHealth(addr);
+  let probe = await probeHealth(addr);
+  for (let i = 1; i < PROBE_TRIES && probe === "empty"; i++) {
+    probe = await probeHealth(addr);
+  }
   if (probe === "alien") {
     throw new Error(
       `MEMSTATE_ADDR=${addr} is occupied by a non-memstate process; refusing to start.`
+    );
+  }
+  if (probe === "empty" && isRemoteAddr(addr)) {
+    throw new Error(
+      `no memstate daemon answered at http://${addr}/health after ${PROBE_TRIES} ` +
+        `probes. ${addr} is not an address of this machine, so the proxy does ` +
+        `not start a daemon there. Start memstated on that machine, or check ` +
+        `the network path to it.`
     );
   }
   if (probe === "empty") {
