@@ -19,6 +19,7 @@
  */
 import { spawn, execSync, ChildProcess } from "child_process";
 import * as fs from "fs";
+import * as os from "os";
 import * as path from "path";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -100,7 +101,14 @@ function deriveProjectId(): string {
     /* not a git repo */
   }
   if (!base) base = path.basename(process.cwd());
-  const slug = base
+  return slugName(base);
+}
+
+// slugName is the shared id rule: lowercase, runs of other characters
+// become "_", edge underscores trimmed. The Python skill and the Go daemon
+// apply the same rule.
+function slugName(name: string): string {
+  const slug = name
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "_")
     .replace(/^_+|_+$/g, "");
@@ -108,6 +116,78 @@ function deriveProjectId(): string {
 }
 
 const DEFAULT_PROJECT = deriveProjectId();
+
+// USER_PROJECT is the daemon's one reserved project for facts about the
+// user and the host. The daemon rejects writes there outside a short
+// allowlist of keypath shapes. slugName never yields a leading "_", so no
+// repo can collide with it.
+const USER_PROJECT = "_user";
+
+// HOST_SLUG names this machine under host.<slug> in USER_PROJECT: the first
+// hostname label, slugged.
+const HOST_SLUG = slugName(os.hostname().split(".")[0]);
+
+const SCOPE_PROP = {
+  type: "string",
+  enum: ["project", "user"],
+  default: "project",
+  description:
+    '"project" (default) = this repo\'s memories. "user" = the reserved ' +
+    "user scope: facts about the user or this machine that hold in every " +
+    "repo (preferences, profile, host env, host tools). Never both scope " +
+    '"user" and project_id.',
+};
+
+type ToolArgs = Record<string, unknown>;
+
+// resolveProject picks the project id for a call: the reserved user
+// project for scope "user", else the explicit id, else this repo's.
+function resolveProject(a: ToolArgs): string {
+  if (a.scope === "user") {
+    if (a.project_id) {
+      throw new Error('pass scope="user" or project_id, not both');
+    }
+    return USER_PROJECT;
+  }
+  if (a.scope !== undefined && a.scope !== "project") {
+    throw new Error(`unknown scope ${JSON.stringify(a.scope)}; use "project" or "user"`);
+  }
+  return String(a.project_id || DEFAULT_PROJECT);
+}
+
+// stripScope removes the proxy-only `scope` field before a body reaches
+// the daemon, which rejects unknown fields.
+function stripScope(a: ToolArgs): ToolArgs {
+  const { scope: _scope, ...rest } = a;
+  return rest;
+}
+
+type TreeNode = { name: string; children?: TreeNode[]; has_value?: boolean };
+
+// pruneOtherHosts keeps only this machine's subtree under `host`.
+function pruneOtherHosts(domains: TreeNode[]): TreeNode[] {
+  return domains.map((d) =>
+    d.name === "host"
+      ? { ...d, children: (d.children ?? []).filter((c) => c.name === HOST_SLUG) }
+      : d
+  );
+}
+
+function countValues(nodes: TreeNode[]): number {
+  let n = 0;
+  for (const node of nodes) {
+    if (node.has_value) n++;
+    n += countValues(node.children ?? []);
+  }
+  return n;
+}
+
+// isOtherHost reports whether a user-scope keypath describes another
+// machine.
+function isOtherHost(keypath: string): boolean {
+  const seg = keypath.split(".");
+  return seg[0] === "host" && seg.length >= 2 && seg[1] !== HOST_SLUG;
+}
 
 // ---------- daemon lifecycle ----------
 
@@ -417,6 +497,7 @@ const TOOLS: ToolDef[] = [
             "name). Only pass an id that memstate_get(list_projects=true) " +
             "lists — never invent a variant.",
         },
+        scope: SCOPE_PROP,
         keypath: {
           type: "string",
           description:
@@ -454,7 +535,7 @@ const TOOLS: ToolDef[] = [
     },
     handler: (a) =>
       postJSON("/memories/store", {
-        project_id: a.project_id || DEFAULT_PROJECT,
+        project_id: resolveProject(a),
         keypath: a.keypath,
         content: a.value,
         source: a.source,
@@ -484,6 +565,7 @@ const TOOLS: ToolDef[] = [
             "name). Only pass an id that memstate_get(list_projects=true) " +
             "lists — never invent a variant.",
         },
+        scope: SCOPE_PROP,
         keypath: {
           type: "string",
           description:
@@ -524,8 +606,8 @@ const TOOLS: ToolDef[] = [
     },
     handler: (a) =>
       postJSON("/memories/remember", {
-        ...a,
-        project_id: a.project_id || DEFAULT_PROJECT,
+        ...stripScope(a),
+        project_id: resolveProject(a),
       }),
   },
   {
@@ -543,6 +625,7 @@ const TOOLS: ToolDef[] = [
           description:
             "OMIT to use this session's default (derived from the repo name)",
         },
+        scope: SCOPE_PROP,
         keypath: {
           type: "string",
           description:
@@ -563,7 +646,7 @@ const TOOLS: ToolDef[] = [
       if (a.list_projects) {
         return getJSON("/projects");
       }
-      const pid = String(a.project_id || DEFAULT_PROJECT);
+      const pid = resolveProject(a);
       if (a.keypath) {
         return postJSON("/keypaths", {
           project_id: pid,
@@ -572,7 +655,29 @@ const TOOLS: ToolDef[] = [
           include_content: a.include_content ?? true,
         });
       }
-      return getJSON(`/tree?project_id=${encodeURIComponent(pid)}`);
+      const tree = (await getJSON(
+        `/tree?project_id=${encodeURIComponent(pid)}`
+      )) as Record<string, unknown>;
+      if (pid === USER_PROJECT) {
+        return tree;
+      }
+      // The user scope rides along with every project tree, pruned to this
+      // machine, so the agent sees env facts without knowing to ask. It is
+      // a bonus: a soft-deleted _user project (409) must not hide the
+      // project tree.
+      let user: { domains?: TreeNode[] } = {};
+      try {
+        user = (await getJSON(
+          `/tree?project_id=${encodeURIComponent(USER_PROJECT)}`
+        )) as { domains?: TreeNode[] };
+      } catch {
+        /* user scope unavailable */
+      }
+      const domains = pruneOtherHosts(user.domains ?? []);
+      return {
+        ...tree,
+        user: { host: HOST_SLUG, domains, total_memories: countValues(domains) },
+      };
     },
   },
   {
@@ -596,6 +701,7 @@ const TOOLS: ToolDef[] = [
           description:
             "OMIT to use this session's default (derived from the repo name)",
         },
+        scope: SCOPE_PROP,
         all_projects: {
           type: "boolean",
           default: false,
@@ -641,12 +747,21 @@ const TOOLS: ToolDef[] = [
       },
       required: ["query"],
     },
-    handler: (a) => {
-      const { all_projects, ...body } = a;
-      if (!all_projects && !body.project_id) {
-        body.project_id = DEFAULT_PROJECT;
+    handler: async (a) => {
+      const { all_projects, ...body } = stripScope(a);
+      if (!all_projects) {
+        body.project_id = resolveProject(a);
       }
-      return postJSON("/memories/search", body);
+      const out = (await postJSON("/memories/search", body)) as {
+        results?: { keypath: string }[];
+        total_found?: number;
+      };
+      if (a.scope === "user" && Array.isArray(out.results)) {
+        // Facts about another machine are noise here.
+        out.results = out.results.filter((h) => !isOtherHost(h.keypath));
+        out.total_found = out.results.length;
+      }
+      return out;
     },
   },
   {
@@ -665,6 +780,7 @@ const TOOLS: ToolDef[] = [
           description:
             "OMIT to use this session's default (derived from the repo name)",
         },
+        scope: SCOPE_PROP,
         keypath: { type: "string", description: "required unless memory_id is given" },
         memory_id: {
           type: "integer",
@@ -674,9 +790,9 @@ const TOOLS: ToolDef[] = [
       },
     },
     handler: (a) => {
-      const body = { ...a };
-      if (body.keypath && !body.project_id) {
-        body.project_id = DEFAULT_PROJECT;
+      const body = stripScope(a);
+      if (body.keypath) {
+        body.project_id = resolveProject(a);
       }
       return postJSON("/memories/history", body);
     },
@@ -697,6 +813,7 @@ const TOOLS: ToolDef[] = [
           description:
             "OMIT to use this session's default (derived from the repo name)",
         },
+        scope: SCOPE_PROP,
         keypath: { type: "string", description: "exact keypath, or subtree root when recursive" },
         recursive: {
           type: "boolean",
@@ -708,8 +825,8 @@ const TOOLS: ToolDef[] = [
     },
     handler: (a) =>
       postJSON("/memories/delete", {
-        ...a,
-        project_id: a.project_id || DEFAULT_PROJECT,
+        ...stripScope(a),
+        project_id: resolveProject(a),
       }),
   },
   {
@@ -772,7 +889,27 @@ Conventions — follow these EXACTLY; every deviation fragments the store:
 - Heading extraction (memstate_remember without keypath) writes each
   "## Section" at the top level — "## Auth" lands at keypath "auth",
   exactly like an explicit write. Pass root="notes" (etc.) only when you
-  deliberately want sections nested under a prefix.`;
+  deliberately want sections nested under a prefix.
+
+User scope — facts that are not about this project:
+- Pass scope="user" (never a project_id) to reach the reserved user scope.
+  memstate_get() with no arguments already returns it under "user", pruned
+  to this machine, so read it there first.
+- A fact belongs in the user scope only when ALL three hold: (1) it stays
+  true if this repo is deleted, it is not about any code; (2) it is true
+  in every repo, for this user or for this machine; (3) it describes the
+  user or the host, not work. Never a decision, todo, task summary, note,
+  or gotcha about code — those stay in the project.
+- The daemon enforces a keypath allowlist there and rejects everything
+  else with 400. Allowed shapes:
+    preferences.<topic>                 stated global working preferences
+    profile.<topic>                     who the user is; never credentials
+    host.${HOST_SLUG}.env.<topic>       OS, shell, paths, runtimes, ports
+    host.${HOST_SLUG}.tools.<topic>     how an installed tool is configured
+  This machine's host slug is "${HOST_SLUG}". Host facts need an explicit
+  keypath; heading extraction fits only "## Preferences" and "## Profile".
+- Never store secrets, tokens, or credentials in any scope. The denied-prompt
+  rule applies to the user scope too.`;
 
 // ---------- main ----------
 

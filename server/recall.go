@@ -81,9 +81,16 @@ func runRecall(stdin io.Reader, stdout io.Writer) int {
 		debug("search: %v", err)
 		return 0
 	}
+	// The user scope is a bonus: a failure there must not hide project hits.
+	userHits, err := recallSearch(addr, userProject, ev.Prompt)
+	if err != nil {
+		debug("user scope search: %v", err)
+		userHits = nil
+	}
+	userHits = filterHostHits(userHits, hostSlug())
 	seenPath := recallSeenPath(ev.SessionID)
 	seen := loadSeen(seenPath)
-	text, shown := renderRecall(project, hits, seen, recallMaxHits, recallMaxChars)
+	text, shown := renderRecall(project, hits, userHits, seen, recallMaxHits, recallMaxChars)
 	if text == "" {
 		return 0
 	}
@@ -156,39 +163,73 @@ func recallSearch(addr, project, prompt string) ([]recallHit, error) {
 	return out.Results, nil
 }
 
-// renderRecall formats up to maxHits hits whose keypath is not in seen.
-// Hits ranked below maxHits fill the slots that seen hits free up, but only
-// when the semantic side returned them: an FTS-only hit that deep is a
-// common-word match, not a topic match. It returns the block and the
-// keypaths it printed. An empty block means nothing new to show.
-func renderRecall(project string, hits []recallHit, seen map[string]bool, maxHits, maxChars int) (string, []string) {
-	var b strings.Builder
-	var shown []string
+// userSeenPrefix scopes seen-file keys for user-scope hits, so a project
+// keypath with the same name is not suppressed by them.
+const userSeenPrefix = userProject + "/"
+
+// filterHostHits drops user-scope hits that describe another machine:
+// anything under host.<slug> where slug is not this host.
+func filterHostHits(hits []recallHit, host string) []recallHit {
+	out := hits[:0:0]
+	for _, h := range hits {
+		seg := strings.SplitN(h.Keypath, ".", 3)
+		if len(seg) >= 2 && seg[0] == "host" && seg[1] != host {
+			continue
+		}
+		out = append(out, h)
+	}
+	return out
+}
+
+// pickRecall selects up to max unseen hits. Hits ranked below max fill the
+// slots that seen hits free up, but only when the semantic side returned
+// them: an FTS-only hit that deep is a common-word match, not a topic match.
+func pickRecall(hits []recallHit, seen map[string]bool, seenPrefix string, max int) []recallHit {
+	var out []recallHit
 	for i, h := range hits {
-		if len(shown) == maxHits {
+		if len(out) == max {
 			break
 		}
-		if seen[h.Keypath] {
+		if seen[seenPrefix+h.Keypath] {
 			continue
 		}
-		if i >= maxHits && !slices.Contains(h.Sources, "semantic") {
+		if i >= max && !slices.Contains(h.Sources, "semantic") {
 			continue
 		}
-		if len(shown) == 0 {
-			fmt.Fprintf(&b, "<memstate-recall project=%q>\n", project)
-			b.WriteString("Memories related to this prompt. Call memstate_get(keypath) for full content.\n\n")
-		}
-		fmt.Fprintf(&b, "### %s", h.Keypath)
+		out = append(out, h)
+	}
+	return out
+}
+
+// renderRecall formats up to maxHits hits from the project and the user
+// scope. One slot is reserved for the best user-scope hit, marked [user];
+// project hits fill the rest. It returns the block and the seen-file keys it
+// printed. An empty block means nothing new to show.
+func renderRecall(project string, hits, userHits []recallHit, seen map[string]bool, maxHits, maxChars int) (string, []string) {
+	user := pickRecall(userHits, seen, userSeenPrefix, 1)
+	proj := pickRecall(hits, seen, "", maxHits-len(user))
+	if len(user)+len(proj) == 0 {
+		return "", nil
+	}
+	var b strings.Builder
+	var shown []string
+	fmt.Fprintf(&b, "<memstate-recall project=%q>\n", project)
+	b.WriteString("Memories related to this prompt. Call memstate_get(keypath) for full content.\n\n")
+	write := func(h recallHit, marker, seenKey string) {
+		fmt.Fprintf(&b, "### %s%s", h.Keypath, marker)
 		if h.Category != "" {
 			fmt.Fprintf(&b, " [%s]", h.Category)
 		}
 		b.WriteString("\n")
 		b.WriteString(cutRunes(strings.TrimSpace(h.Content), maxChars))
 		b.WriteString("\n\n")
-		shown = append(shown, h.Keypath)
+		shown = append(shown, seenKey)
 	}
-	if len(shown) == 0 {
-		return "", nil
+	for _, h := range proj {
+		write(h, "", h.Keypath)
+	}
+	for _, h := range user {
+		write(h, " [user]", userSeenPrefix+h.Keypath)
 	}
 	b.WriteString("</memstate-recall>\n")
 	return b.String(), shown

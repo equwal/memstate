@@ -215,6 +215,14 @@ func (s *Store) mergeProject(target string, memories []ExportMemory, force bool)
 func mergeKeypath(tx dbExec, target string, chain []ExportMemory, st *MergeStats, force bool) error {
 	kp := chain[0].Keypath
 	srcLatest := chain[len(chain)-1]
+	// The fresh-keypath path below inserts rows directly, so the reserved
+	// gate runs here too. A chain that ends in a tombstone is history, not
+	// a live fact, and passes.
+	if !srcLatest.Tombstone {
+		if err := checkReservedWrite(target, kp); err != nil {
+			return err
+		}
+	}
 	local, err := getLatestExec(tx, target, kp)
 	if err != nil {
 		return err

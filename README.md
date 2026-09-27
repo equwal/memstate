@@ -170,8 +170,9 @@ Pass it only to reach a different project. Keypaths use dot notation.
 
 A useful agent loop:
 
-- At task start, call `memstate_get()` to load the tree. The proxy derives the project id from the repository name. Call `memstate_search(query=...)` when you do not know the exact keypath.
+- At task start, call `memstate_get()` to load the tree. The proxy derives the project id from the repository name. The response also carries the user scope under `user`. Call `memstate_search(query=...)` when you do not know the exact keypath.
 - At task end, call `memstate_remember(content="## Summary\n...\n## Decisions\n...")` and let the server extract the sections.
+- Facts about the user or this machine, not about the code, go to `scope="user"`: `preferences.*`, `profile.*`, `host.<host_slug>.env.*`, `host.<host_slug>.tools.*`. The daemon rejects any other keypath there, so decisions and task summaries cannot leak into a shared store.
 - Never save a denied prompt. A denied prompt is a tool call that the user or a permission check denied.
 
 `node client/dist/index.js init` writes rule files for several agents

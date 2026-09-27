@@ -318,6 +318,12 @@ func (s *Store) Write(projectID, keypath, content string, meta WriteMeta, tombst
 // values point at the same prior memory — callers detect "unchanged" via
 // pointer or ID equality.
 func writeExec(exec dbExec, projectID, keypath, content string, meta WriteMeta, tombstone bool) (*Memory, *Memory, error) {
+	// A tombstone skips the gate so an old mistake in _user can be deleted.
+	if !tombstone {
+		if err := checkReservedWrite(projectID, keypath); err != nil {
+			return nil, nil, err
+		}
+	}
 	prev, err := getLatestExec(exec, projectID, keypath)
 	if err != nil {
 		return nil, nil, err

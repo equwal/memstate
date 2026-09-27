@@ -57,6 +57,17 @@ that the user or a permission check denied. Do not save its tool name, its
 command, its arguments, or the fact of the denial. Do not save it under any
 keypath or category, in a task summary, or as a warning for a later session.
 
+## User scope
+
+Facts about the user or this machine, not about the code, go to the
+reserved user scope: pass \`scope="user"\` instead of a project_id. A fact
+belongs there only when it stays true if this repo is deleted, holds in
+every repo, and describes the user or the host rather than work. The
+daemon allows only these keypath shapes there and rejects the rest:
+\`preferences.<topic>\`, \`profile.<topic>\`, \`host.<host_slug>.env.<topic>\`,
+\`host.<host_slug>.tools.<topic>\`. \`memstate_get()\` returns the user scope
+under \`user\` next to the project tree. Never store secrets there.
+
 ## Tools
 
 | Tool | When to use |

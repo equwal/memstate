@@ -76,6 +76,51 @@ Every deviation fragments the store into disconnected near-duplicates.
 - **source**: A short provenance string, for example `claude-code
   session 2026_07_04` or `user decision`. Shown in history.
 
+## User scope: facts that are not about this project
+
+Every memory lives in a project by default. Some facts are about the
+user or the machine and hold in every repository: an installed tool, a
+path, the Ollama URL, a working preference, the user's role. These go
+in the reserved project `_user`. Every script reaches it with
+`--scope user` (never with `--project`).
+
+A fact belongs in the user scope only when ALL three hold:
+
+1. It stays true if this repository is deleted. It is not about any code.
+2. It is true in every repository, for this user or for this machine.
+3. It describes the user or the host, not work. Never a decision, todo,
+   task summary, note, or gotcha about code. Those stay in the project.
+
+The daemon enforces this line with a keypath allowlist. A write outside
+it returns HTTP 400 and nothing is stored. Allowed shapes:
+
+| Shape | Meaning | Example |
+|---|---|---|
+| `preferences.<topic>` | stated global working preferences | `preferences.commit_style` |
+| `profile.<topic>` | who the user is; never credentials | `profile.role` |
+| `host.<host_slug>.env.<topic>` | OS, shell, paths, runtimes, ports | `host.mbp.env.go_bin` |
+| `host.<host_slug>.tools.<topic>` | how an installed tool is configured | `host.mbp.tools.ollama_url` |
+
+`<host_slug>` is the first label of the hostname, slugged like a project
+id (`Matts-MBP.local` → `matts_mbp`). `memstate_get.py` prints it as
+`user.host`. Reads prune other machines' `host.*` subtrees; searches with
+`--scope user` drop them.
+
+```bash
+python3 scripts/memstate_set.py --scope user --keypath preferences.commit_style \
+  --value "short subjects, no trailers" --category config
+python3 scripts/memstate_set.py --scope user --keypath host.matts_mbp.tools.ollama_url \
+  --value "http://127.0.0.1:11434, model qwen3-embedding:4b" --category config
+python3 scripts/memstate_get.py --scope user --keypath preferences --include-content
+```
+
+Heading extraction (`memstate_remember.py --scope user` without
+`--keypath`) fits only `## Preferences` and `## Profile`. Host facts need
+an explicit `--keypath`. One bad section rejects the whole call.
+
+Never store secrets, tokens, or credentials in any scope. The
+denied-prompt rule applies to the user scope too.
+
 ## Workflows
 
 ### Before starting a task (recall)
@@ -250,6 +295,9 @@ Any write to the same project_id revives it with all memories intact.
    user or a permission check denied. Do not save it under any keypath, in
    any category, or in any summary. Do not save it as a warning for a later
    session. No reason overrides this rule.
+8. **Keep user facts out of projects, and work out of the user scope.**
+   A tool path or a global preference goes to `--scope user`; a
+   decision, todo, or summary never does. The daemon rejects the latter.
 
 ## Connecting to the daemon
 

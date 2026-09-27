@@ -404,6 +404,94 @@ async function main() {
       !r.isError && !tree.isError && tree.data.total_memories > 1,
       JSON.stringify(tree));
 
+    // ---- user scope -----------------------------------------------------------
+    // The reserved project `_user` holds facts about the user and this
+    // machine. The daemon allows only preferences.*, profile.*,
+    // host.<slug>.env.* and host.<slug>.tools.* there.
+    const instr = client.getInstructions() ?? "";
+    const hostSlug = /host slug is "([a-z0-9_]+)"/.exec(instr)?.[1] ?? "";
+    check("instructions: describe the user scope and this host's slug",
+      instr.includes("User scope") && hostSlug !== "",
+      "");
+    r = await call(client, "memstate_set", {
+      scope: "user", keypath: "preferences.commit_style",
+      value: "short subjects, no trailers",
+    });
+    check("user scope: preferences write is accepted",
+      !r.isError && r.data.action === "created",
+      JSON.stringify(r));
+    r = await call(client, "memstate_set", { scope: "user", keypath: "todo.x", value: "nope" });
+    check("user scope: todo write is rejected with the allowed shapes",
+      r.isError && r.message.includes("allowed"),
+      JSON.stringify(r));
+    r = await call(client, "memstate_set", { project_id: "_scratch", keypath: "preferences.x", value: "nope" });
+    check("user scope: other reserved ids are rejected",
+      r.isError && r.message.includes("reserved"),
+      JSON.stringify(r));
+    r = await call(client, "memstate_set", {
+      scope: "user", project_id: PROJECT, keypath: "preferences.x", value: "nope",
+    });
+    check("user scope: scope and project_id together is an error",
+      r.isError,
+      JSON.stringify(r));
+    r = await call(client, "memstate_set", {
+      scope: "user", keypath: `host.${hostSlug}.env.go_bin`,
+      value: "go binaries live in ~/.go/bin",
+    });
+    check("user scope: this host's env write is accepted",
+      !r.isError && r.data.action === "created",
+      JSON.stringify(r));
+    r = await call(client, "memstate_set", {
+      project_id: "_user", keypath: "host.other_box.env.go_bin",
+      value: "go binaries live in /opt/go/bin on the other box",
+    });
+    check("user scope: another host's env write is accepted",
+      !r.isError,
+      JSON.stringify(r));
+    r = await call(client, "memstate_get", { project_id: PROJECT });
+    const hostNode = r.data?.user?.domains?.find((d) => d.name === "host");
+    check("get: tree carries the user scope pruned to this host",
+      !r.isError && r.data.user.host === hostSlug &&
+        r.data.user.domains.some((d) => d.name === "preferences") &&
+        hostNode && hostNode.children.length === 1 &&
+        hostNode.children[0].name === hostSlug &&
+        r.data.user.total_memories === 2,
+      JSON.stringify(r.data?.user));
+    r = await call(client, "memstate_search", { scope: "user", query: "go binaries live", mode: "fts" });
+    check("search: user scope drops other hosts",
+      !r.isError && r.data.results.length === 1 &&
+        r.data.results[0].keypath === `host.${hostSlug}.env.go_bin`,
+      JSON.stringify(r));
+    r = await call(client, "memstate_remember", {
+      scope: "user", content: "## Preferences\nanswer tersely\n\n## Todo\nfinish\n",
+    });
+    check("remember: user scope rejects a summary with a todo section",
+      r.isError,
+      JSON.stringify(r));
+    r = await call(client, "memstate_get", { scope: "user", keypath: "preferences" });
+    check("remember: the rejected summary wrote nothing",
+      !r.isError && r.data.memories.length === 1 &&
+        r.data.memories[0].content.includes("no trailers"),
+      JSON.stringify(r));
+    // A soft-deleted _user project must not break every project read.
+    r = await call(client, "memstate_delete_project", { project_id: "_user" });
+    check("user scope: the reserved project can be soft-deleted",
+      !r.isError,
+      JSON.stringify(r));
+    r = await call(client, "memstate_get", { project_id: PROJECT });
+    check("get: a deleted user scope yields an empty user block, not an error",
+      !r.isError && r.data.domains.length > 0 && r.data.user.total_memories === 0,
+      JSON.stringify(r));
+    r = await call(client, "memstate_set", {
+      scope: "user", keypath: "preferences.commit_style",
+      value: "short subjects, no trailers, imperative mood",
+    });
+    const userTree = await call(client, "memstate_get", { scope: "user" });
+    check("user scope: a write revives the reserved project",
+      !r.isError && r.data.action === "superseded" &&
+        !userTree.isError && userTree.data.total_memories >= 1,
+      JSON.stringify([r, userTree]));
+
     // ---- error path -----------------------------------------------------------
     const bad = await client.callTool({ name: "memstate_set", arguments: {} });
     check("set: missing required fields is an error",

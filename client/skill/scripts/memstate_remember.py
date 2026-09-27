@@ -7,18 +7,22 @@ Two modes:
             own keypath (deeper headings nest via dot segments). Use --root
             to apply a common prefix to every extracted keypath.
 
+--scope user writes to the reserved user scope. Only sections that land at
+preferences.* or profile.* pass the daemon's allowlist there; host facts
+need an explicit --keypath host.<host_slug>.env.* or .tools.*. One bad
+section rejects the whole call, nothing is written.
+
 Server response (both modes): { method, items: [{keypath, action, stored, superseded?}] }.
 """
 import argparse
 import sys
 
-from _client import default_project, post
+from _client import add_scope_args, post, resolve_project
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Save a markdown summary")
-    ap.add_argument("--project", default=None,
-                    help="project id (default: derived from repo/dir name)")
+    add_scope_args(ap)
     ap.add_argument("--keypath", default=None,
                     help="optional — omit to extract keypaths from ## headings")
     ap.add_argument("--content", required=True)
@@ -32,7 +36,7 @@ def main() -> int:
     args = ap.parse_args()
 
     body = {
-        "project_id": args.project or default_project(),
+        "project_id": resolve_project(args),
         "content": args.content,
     }
     if args.keypath:
