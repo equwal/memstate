@@ -375,6 +375,32 @@ python3 client/skill/scripts/memstate_search.py \
 
 See `client/skill/SKILL.md` for the skill usage contract.
 
+## Browse and edit from the shell (`memstate`)
+
+`make install` links `memstate` to the daemon binary. It reads the SQLite
+file directly and sends writes through the shared daemon, so versioning,
+embeddings and the user-scope rules apply exactly as they do for an agent.
+The project defaults to the repository you are in.
+
+```bash
+memstate tree                          # keypath tree for this repo, plus your user scope
+memstate get decisions                 # content under one keypath
+memstate get todo --raw | less         # content only
+memstate history config.port           # every version, newest first
+memstate search "why sqlite" --limit 5 # hybrid search via the daemon
+memstate set config.port 8080 --category config
+memstate edit notes.setup              # $EDITOR on the current content
+memstate rm branches.old --recursive   # asks y/N; --yes to skip
+memstate tree --user                   # preferences, profile, this host's env and tools
+memstate tree --json | jq .user        # raw shapes for scripts
+memstate projects                      # every live project
+```
+
+`--project ID` reaches another project, `--user` the reserved user scope,
+`--all` (search) the whole store. Flags may follow positionals. Without a
+shared daemon, reads still work and `search` degrades to FTS; `set`, `edit`
+and `rm` tell you how to start one.
+
 ## How the pieces fit
 
 ```

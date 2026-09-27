@@ -62,6 +62,13 @@ func reservedKeypathErr(keypath string) error {
 		ErrReservedWrite, keypath, userProject, allowedUserShapes)
 }
 
+// isOtherHost reports whether a user-scope keypath describes another
+// machine: anything under host.<slug> where slug is not host.
+func isOtherHost(keypath, host string) bool {
+	seg := strings.SplitN(keypath, ".", 3)
+	return len(seg) >= 2 && seg[0] == "host" && seg[1] != host
+}
+
 // hostSlug names this machine inside userProject: the first label of the
 // hostname, slugged like a project id. The TS proxy and the Python skill
 // apply the same rule, so all three agree on the segment.

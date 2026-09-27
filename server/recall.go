@@ -172,11 +172,9 @@ const userSeenPrefix = userProject + "/"
 func filterHostHits(hits []recallHit, host string) []recallHit {
 	out := hits[:0:0]
 	for _, h := range hits {
-		seg := strings.SplitN(h.Keypath, ".", 3)
-		if len(seg) >= 2 && seg[0] == "host" && seg[1] != host {
-			continue
+		if !isOtherHost(h.Keypath, host) {
+			out = append(out, h)
 		}
-		out = append(out, h)
 	}
 	return out
 }
