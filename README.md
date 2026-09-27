@@ -173,6 +173,7 @@ A useful agent loop:
 - At task start, call `memstate_get()` to load the tree. The proxy derives the project id from the repository name. The response also carries the user scope under `user`. Call `memstate_search(query=...)` when you do not know the exact keypath.
 - At task end, call `memstate_remember(content="## Summary\n...\n## Decisions\n...")` and let the server extract the sections.
 - Facts about the user or this machine, not about the code, go to `scope="user"`: `preferences.*`, `profile.*`, `host.<host_slug>.env.*`, `host.<host_slug>.tools.*`. The daemon rejects any other keypath there, so decisions and task summaries cannot leak into a shared store.
+- When the prompt is clearly about another subject than the directory (for example an nginx config asked from the home directory), pin the session once with `project_name`. Prefer an existing id. A new id needs `new_project=true` too and is refused when it looks like an existing one. The recall hook's first-prompt `<memstate-scope>` block shows the cwd project and the other projects the prompt matches.
 - Never save a denied prompt. A denied prompt is a tool call that the user or a permission check denied.
 
 `node client/dist/index.js init` writes rule files for several agents

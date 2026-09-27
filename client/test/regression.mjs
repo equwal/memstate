@@ -493,6 +493,81 @@ async function main() {
         !userTree.isError && userTree.data.total_memories >= 1,
       JSON.stringify([r, userTree]));
 
+    // ---- session project ------------------------------------------------------
+    // The cwd project stays the default. project_name pins a session once,
+    // with caution rules against misspelled or invented names.
+    check("instructions: describe the session project override",
+      instr.includes("Session project") && instr.includes("new_project"),
+      "");
+    r = await call(client, "memstate_set", { project_id: "other_proj", keypath: "notes.a", value: "seed" });
+    check("session: seed another project", !r.isError, JSON.stringify(r));
+    r = await call(client, "memstate_get", { project_name: "nope_project" });
+    check("session: an unknown project_name needs new_project",
+      r.isError && r.message.includes("new_project") && r.message.includes("list_projects"),
+      JSON.stringify(r));
+    r = await call(client, "memstate_get", { project_name: "regress_tests", new_project: true });
+    check("session: a near-duplicate name is refused even with new_project",
+      r.isError && r.message.includes(`"${PROJECT}"`),
+      JSON.stringify(r));
+    r = await call(client, "memstate_get", { project_name: "otherproj", new_project: true });
+    check("session: a name equal after normalization is refused",
+      r.isError && r.message.includes('"other_proj"'),
+      JSON.stringify(r));
+    r = await call(client, "memstate_get", { project_name: "_user" });
+    check("session: a reserved or malformed name is refused",
+      r.isError && r.message.includes("snake_case"),
+      JSON.stringify(r));
+    r = await call(client, "memstate_set", {
+      project_name: "other_proj", scope: "user", keypath: "preferences.x", value: "v",
+    });
+    check("session: project_name with scope=user is an error",
+      r.isError,
+      JSON.stringify(r));
+    r = await call(client, "memstate_get", { project_name: "taxes_2026", new_project: true });
+    check("session: a clearly new name with new_project pins the session",
+      !r.isError && r.data.session_project === "taxes_2026" && r.data.project_id === "taxes_2026",
+      JSON.stringify(r));
+    r = await call(client, "memstate_set", { keypath: "notes.b", value: "pinned write" });
+    check("session: later calls without project_id use the pinned project",
+      !r.isError && r.data.stored.project_id === "taxes_2026" && r.data.session_project === "taxes_2026",
+      JSON.stringify(r));
+    r = await call(client, "memstate_get", { project_name: "other_proj" });
+    check("session: a second different project_name is an error",
+      r.isError && r.message.includes("pinned"),
+      JSON.stringify(r));
+    r = await call(client, "memstate_get", { project_name: "taxes_2026" });
+    check("session: the same project_name again is fine",
+      !r.isError,
+      JSON.stringify(r));
+    r = await call(client, "memstate_set", { project_id: PROJECT, keypath: "config.gamma", value: "explicit id beats the pin" });
+    check("session: explicit project_id still reaches another project",
+      !r.isError && r.data.stored.project_id === PROJECT,
+      JSON.stringify(r));
+    const projects = await call(client, "memstate_get", { list_projects: true });
+    const ids = projects.data.projects.map((p) => p.id);
+    check("session: refused names created no project",
+      !ids.includes("nope_project") && !ids.includes("regress_tests") && !ids.includes("otherproj") &&
+        ids.includes("taxes_2026"),
+      ids.join(","));
+    // A fresh proxy has no pin; an existing id pins it directly. Its cwd
+    // basename slugs to PROJECT.
+    const freshCwd = path.join(tmp, "regress_test");
+    fs.mkdirSync(freshCwd);
+    await withProxy(env, freshCwd, async (fresh) => {
+      let f = await call(fresh, "memstate_get", {});
+      check("session: a new proxy starts on the cwd default without a pin",
+        !f.isError && f.data.project_id === PROJECT && f.data.session_project === undefined,
+        JSON.stringify(f));
+      f = await call(fresh, "memstate_get", { project_name: "other_proj" });
+      check("session: an existing project_name pins without new_project",
+        !f.isError && f.data.session_project === "other_proj" && f.data.project_id === "other_proj",
+        JSON.stringify(f));
+      f = await call(fresh, "memstate_search", { query: "seed", mode: "fts" });
+      check("session: search without project_id uses the pin",
+        !f.isError && f.data.results.length === 1 && f.data.results[0].project_id === "other_proj",
+        JSON.stringify(f));
+    });
+
     // ---- error path -----------------------------------------------------------
     const bad = await client.callTool({ name: "memstate_set", arguments: {} });
     check("set: missing required fields is an error",
@@ -542,6 +617,25 @@ async function main() {
     process.exit(1);
   }
   process.stdout.write("\nall regression checks passed\n");
+}
+
+// withProxy connects a second, fresh proxy (own process, own session pin)
+// to the same DB in child mode, runs fn, and closes it.
+async function withProxy(env, cwd, fn) {
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [PROXY],
+    env,
+    cwd,
+    stderr: "ignore",
+  });
+  const fresh = new Client({ name: "regression-test-2", version: "0.0.0" });
+  await fresh.connect(transport);
+  try {
+    await fn(fresh);
+  } finally {
+    await fresh.close();
+  }
 }
 
 // withSharedDaemon starts `memstated --addr 127.0.0.1:0` with env, waits

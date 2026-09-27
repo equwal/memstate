@@ -37,10 +37,11 @@ type hookEvent struct {
 }
 
 type recallHit struct {
-	Keypath  string   `json:"keypath"`
-	Content  string   `json:"content"`
-	Category string   `json:"category"`
-	Sources  []string `json:"sources"`
+	ProjectID string   `json:"project_id"`
+	Keypath   string   `json:"keypath"`
+	Content   string   `json:"content"`
+	Category  string   `json:"category"`
+	Sources   []string `json:"sources"`
 }
 
 var (
@@ -81,6 +82,25 @@ func runRecall(stdin io.Reader, stdout io.Writer) int {
 		debug("search: %v", err)
 		return 0
 	}
+	seenPath := recallSeenPath(ev.SessionID)
+	seen := loadSeen(seenPath)
+
+	// First eligible prompt of the session: show the cwd project and the
+	// other projects this prompt matches, so the model can judge whether
+	// the work belongs elsewhere. The marker in the seen file makes this a
+	// one-time block.
+	var out strings.Builder
+	var shown []string
+	if !seen[scopeMarker] {
+		all, err := recallSearch(addr, "", ev.Prompt)
+		if err != nil {
+			debug("all-projects search: %v", err)
+			all = nil
+		}
+		out.WriteString(scopeBlock(project, ev.Cwd, projectCandidates(all, project)))
+		shown = append(shown, scopeMarker)
+	}
+
 	// The user scope is a bonus: a failure there must not hide project hits.
 	userHits, err := recallSearch(addr, userProject, ev.Prompt)
 	if err != nil {
@@ -88,13 +108,13 @@ func runRecall(stdin io.Reader, stdout io.Writer) int {
 		userHits = nil
 	}
 	userHits = filterHostHits(userHits, hostSlug())
-	seenPath := recallSeenPath(ev.SessionID)
-	seen := loadSeen(seenPath)
-	text, shown := renderRecall(project, hits, userHits, seen, recallMaxHits, recallMaxChars)
-	if text == "" {
+	text, hitKeys := renderRecall(project, hits, userHits, seen, recallMaxHits, recallMaxChars)
+	out.WriteString(text)
+	shown = append(shown, hitKeys...)
+	if out.Len() == 0 {
 		return 0
 	}
-	fmt.Fprint(stdout, text)
+	fmt.Fprint(stdout, out.String())
 	if err := appendSeen(seenPath, shown); err != nil {
 		debug("record seen: %v", err)
 	}
@@ -107,22 +127,123 @@ func recallEligible(prompt string) bool {
 	return len(strings.Fields(prompt)) >= recallMinWords
 }
 
+// repoRoot returns the top-level directory of the git repository that
+// contains cwd, and false when cwd is not inside a repository.
+func repoRoot(cwd string) (string, bool) {
+	if cwd == "" {
+		return "", false
+	}
+	out, err := exec.Command("git", "-C", cwd, "rev-parse", "--show-toplevel").Output()
+	if err != nil {
+		return "", false
+	}
+	root := strings.TrimSpace(string(out))
+	return root, root != ""
+}
+
 // deriveProject maps a working directory to a project id with the same rule
 // as the TS proxy and the Python skill: the git repository name (the
 // directory name outside a repository), lowercased, with every run of
 // characters outside [a-z0-9] replaced by "_" and edge underscores trimmed.
 func deriveProject(cwd string) string {
 	base := ""
-	if cwd != "" {
-		out, err := exec.Command("git", "-C", cwd, "rev-parse", "--show-toplevel").Output()
-		if err == nil {
-			base = filepath.Base(strings.TrimSpace(string(out)))
-		}
+	if root, ok := repoRoot(cwd); ok {
+		base = filepath.Base(root)
 	}
 	if base == "" {
 		base = filepath.Base(cwd)
 	}
 	return slugProject(base)
+}
+
+// scopeMarker is the seen-file line that records that the scope block was
+// shown to this session. It never collides with a keypath.
+const scopeMarker = "#scope"
+
+// projectCandidate is another project whose memories match the prompt.
+type projectCandidate struct {
+	ProjectID string
+	Hits      int
+	Semantic  bool
+}
+
+// projectCandidates groups all-project hits by project, drops the cwd
+// project and the user scope, and keeps a project only on real evidence:
+// two or more hits, or one hit the semantic side returned. At most three,
+// by hit count.
+func projectCandidates(hits []recallHit, cwdProject string) []projectCandidate {
+	byProject := map[string]*projectCandidate{}
+	var order []string
+	for _, h := range hits {
+		if h.ProjectID == "" || h.ProjectID == cwdProject || h.ProjectID == userProject {
+			continue
+		}
+		c, ok := byProject[h.ProjectID]
+		if !ok {
+			c = &projectCandidate{ProjectID: h.ProjectID}
+			byProject[h.ProjectID] = c
+			order = append(order, h.ProjectID)
+		}
+		c.Hits++
+		if slices.Contains(h.Sources, "semantic") {
+			c.Semantic = true
+		}
+	}
+	var out []projectCandidate
+	for _, id := range order {
+		c := byProject[id]
+		if c.Hits >= 2 || c.Semantic {
+			out = append(out, *c)
+		}
+	}
+	slices.SortStableFunc(out, func(a, b projectCandidate) int {
+		if a.Hits != b.Hits {
+			return b.Hits - a.Hits
+		}
+		return strings.Compare(a.ProjectID, b.ProjectID)
+	})
+	if len(out) > 3 {
+		out = out[:3]
+	}
+	return out
+}
+
+// scopeBlock is the first-prompt block: the cwd project, how it was derived,
+// the other projects the prompt matches, and the rule for overriding. The
+// cwd stays the default; the model overrides only on clear evidence, and a
+// new name is a deliberate second step (new_project=true in the proxy).
+func scopeBlock(project, cwd string, cands []projectCandidate) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "<memstate-scope cwd_project=%q>\n", project)
+	if root, ok := repoRoot(cwd); ok {
+		fmt.Fprintf(&b, "The working directory is the git repository %s.\n", filepath.Base(root))
+	} else if home, err := os.UserHomeDir(); err == nil && filepath.Clean(cwd) == filepath.Clean(home) {
+		b.WriteString("The working directory is not a git repository (home directory).\n")
+	} else {
+		fmt.Fprintf(&b, "The working directory is not a git repository (%s).\n", filepath.Base(cwd))
+	}
+	if len(cands) == 0 {
+		b.WriteString("Prompt matches no other project.\n")
+	} else {
+		parts := make([]string, len(cands))
+		for i, c := range cands {
+			s := fmt.Sprintf("%s (%d hit", c.ProjectID, c.Hits)
+			if c.Hits != 1 {
+				s += "s"
+			}
+			if c.Semantic {
+				s += ", semantic"
+			}
+			parts[i] = s + ")"
+		}
+		fmt.Fprintf(&b, "Prompt matches other projects: %s.\n", strings.Join(parts, ", "))
+	}
+	b.WriteString("Default is the cwd project. Override only when this prompt is clearly about " +
+		"another subject: pass project_name=<one of the ids above, or another id from " +
+		"memstate_get(list_projects=true)> on your first memstate call. Do not invent a " +
+		"new name unless nothing fits; then add new_project=true.\n")
+	b.WriteString("</memstate-scope>\n")
+	return b.String()
 }
 
 func slugProject(name string) string {
@@ -137,12 +258,15 @@ func slugProject(name string) string {
 // reply is an error, including "unknown mode" from a daemon that predates
 // hybrid search.
 func recallSearch(addr, project, prompt string) ([]recallHit, error) {
-	body, _ := json.Marshal(map[string]any{
-		"query":      prompt,
-		"project_id": project,
-		"mode":       "hybrid",
-		"limit":      recallSearchLim,
-	})
+	req := map[string]any{
+		"query": prompt,
+		"mode":  "hybrid",
+		"limit": recallSearchLim,
+	}
+	if project != "" {
+		req["project_id"] = project
+	}
+	body, _ := json.Marshal(req)
 	client := &http.Client{Timeout: recallTimeout}
 	resp, err := client.Post("http://"+addr+"/api/v1/memories/search",
 		"application/json", bytes.NewReader(body))

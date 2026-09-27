@@ -141,9 +141,132 @@ const SCOPE_PROP = {
 
 type ToolArgs = Record<string, unknown>;
 
+// ---------- session project ----------
+//
+// The cwd project is the default and the strong prior. On the first prompt
+// the recall hook shows the model the cwd project and the other projects the
+// prompt matches; when the prompt is clearly about another subject, the model
+// pins this session to that project once with project_name. The pin lives in
+// this process only. Caution rules keep misspelled or invented names out of
+// the store: an existing id pins freely, a new id needs new_project=true and
+// is refused when it looks like an existing one.
+
+const PROJECT_ID_RE = /^[a-z0-9]+(_[a-z0-9]+)*$/;
+
+const PROJECT_NAME_PROP = {
+  type: "string",
+  description:
+    "Pin this session to a project other than the cwd default, once, when " +
+    "the prompt is clearly about another subject. Prefer an id that " +
+    "memstate_get(list_projects=true) lists. A new id also needs " +
+    "new_project=true and must not resemble an existing id. Not with " +
+    'project_id or scope="user".',
+};
+
+const NEW_PROJECT_PROP = {
+  type: "boolean",
+  default: false,
+  description:
+    "With project_name only: allow a project id that does not exist yet. " +
+    "Refused when the id looks like a misspelling of an existing project.",
+};
+
+let sessionProject = "";
+
+// normalizeId folds the spellings that produce near-duplicate projects:
+// underscores, digits and a trailing dev/test/tmp/old/new.
+function normalizeId(id: string): string {
+  return id
+    .replace(/_/g, "")
+    .replace(/[0-9]/g, "")
+    .replace(/(dev|test|tests|tmp|old|new)$/, "");
+}
+
+function levenshtein(a: string, b: string): number {
+  const prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    let last = i;
+    for (let j = 1; j <= b.length; j++) {
+      const cur = Math.min(
+        prev[j] + 1,
+        last + 1,
+        prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1)
+      );
+      prev[j - 1] = last;
+      last = cur;
+    }
+    prev[b.length] = last;
+  }
+  return prev[b.length];
+}
+
+// nearDuplicates lists existing ids that name looks like: equal after
+// normalization, one contains the other (both at least four characters), or
+// a small edit distance.
+function nearDuplicates(name: string, ids: string[]): string[] {
+  const n = normalizeId(name);
+  return ids.filter((id) => {
+    if (id === name) return false;
+    const m = normalizeId(id);
+    if (n === m) return true;
+    if (n.length >= 4 && m.length >= 4 && (n.includes(m) || m.includes(n))) return true;
+    const limit = Math.min(n.length, m.length) < 6 ? 1 : 2;
+    return levenshtein(n, m) <= limit;
+  });
+}
+
+async function listProjectIds(): Promise<string[]> {
+  const out = (await getJSON("/projects")) as { projects?: { id: string }[] };
+  return (out.projects ?? []).map((p) => p.id);
+}
+
+// pinSession applies project_name: format, one pin per session, existing id
+// or a deliberate new one that resembles nothing.
+async function pinSession(a: ToolArgs): Promise<void> {
+  const name = a.project_name;
+  if (a.project_id || a.scope === "user") {
+    throw new Error('project_name cannot be combined with project_id or scope="user"');
+  }
+  if (typeof name !== "string" || !PROJECT_ID_RE.test(name)) {
+    throw new Error(
+      "project_name must be lowercase snake_case: words of a-z and 0-9 joined " +
+        'by single underscores, for example "billing_api"'
+    );
+  }
+  if (sessionProject && name !== sessionProject) {
+    throw new Error(
+      `this session is pinned to "${sessionProject}"; pass project_id to reach another project`
+    );
+  }
+  if (name === sessionProject) return;
+  const ids = await listProjectIds();
+  if (ids.includes(name)) {
+    sessionProject = name;
+    return;
+  }
+  const near = nearDuplicates(name, ids);
+  if (near.length > 0) {
+    throw new Error(
+      `"${name}" looks like existing project ${near.map((id) => `"${id}"`).join(", ")}; ` +
+        `use project_name="${near[0]}", or choose a clearly different name`
+    );
+  }
+  if (a.new_project !== true) {
+    throw new Error(
+      `no project "${name}". Pass an id from memstate_get(list_projects=true), ` +
+        "or new_project=true to start a new project"
+    );
+  }
+  sessionProject = name;
+}
+
 // resolveProject picks the project id for a call: the reserved user
-// project for scope "user", else the explicit id, else this repo's.
-function resolveProject(a: ToolArgs): string {
+// project for scope "user", else the explicit id, else the session pin,
+// else this repo's.
+async function resolveProject(a: ToolArgs): Promise<string> {
+  if (a.project_name !== undefined) {
+    await pinSession(a);
+  }
   if (a.scope === "user") {
     if (a.project_id) {
       throw new Error('pass scope="user" or project_id, not both');
@@ -153,14 +276,22 @@ function resolveProject(a: ToolArgs): string {
   if (a.scope !== undefined && a.scope !== "project") {
     throw new Error(`unknown scope ${JSON.stringify(a.scope)}; use "project" or "user"`);
   }
-  return String(a.project_id || DEFAULT_PROJECT);
+  return String(a.project_id || sessionProject || DEFAULT_PROJECT);
 }
 
-// stripScope removes the proxy-only `scope` field before a body reaches
-// the daemon, which rejects unknown fields.
-function stripScope(a: ToolArgs): ToolArgs {
-  const { scope: _scope, ...rest } = a;
+// stripProxyFields removes the fields only the proxy understands before a
+// body reaches the daemon, which rejects unknown fields.
+function stripProxyFields(a: ToolArgs): ToolArgs {
+  const { scope: _scope, project_name: _name, new_project: _new, ...rest } = a;
   return rest;
+}
+
+// withSessionProject tells the model which project a pinned session uses.
+function withSessionProject(result: unknown): unknown {
+  if (sessionProject && result && typeof result === "object" && !Array.isArray(result)) {
+    return { ...(result as Record<string, unknown>), session_project: sessionProject };
+  }
+  return result;
 }
 
 type TreeNode = { name: string; children?: TreeNode[]; has_value?: boolean };
@@ -541,6 +672,8 @@ const TOOLS: ToolDef[] = [
             "lists — never invent a variant.",
         },
         scope: SCOPE_PROP,
+        project_name: PROJECT_NAME_PROP,
+        new_project: NEW_PROJECT_PROP,
         keypath: {
           type: "string",
           description:
@@ -576,9 +709,9 @@ const TOOLS: ToolDef[] = [
       },
       required: ["keypath", "value"],
     },
-    handler: (a) =>
+    handler: async (a) =>
       postJSON("/memories/store", {
-        project_id: resolveProject(a),
+        project_id: await resolveProject(a),
         keypath: a.keypath,
         content: a.value,
         source: a.source,
@@ -609,6 +742,8 @@ const TOOLS: ToolDef[] = [
             "lists — never invent a variant.",
         },
         scope: SCOPE_PROP,
+        project_name: PROJECT_NAME_PROP,
+        new_project: NEW_PROJECT_PROP,
         keypath: {
           type: "string",
           description:
@@ -647,10 +782,10 @@ const TOOLS: ToolDef[] = [
       },
       required: ["content"],
     },
-    handler: (a) =>
+    handler: async (a) =>
       postJSON("/memories/remember", {
-        ...stripScope(a),
-        project_id: resolveProject(a),
+        ...stripProxyFields(a),
+        project_id: await resolveProject(a),
       }),
   },
   {
@@ -669,6 +804,8 @@ const TOOLS: ToolDef[] = [
             "OMIT to use this session's default (derived from the repo name)",
         },
         scope: SCOPE_PROP,
+        project_name: PROJECT_NAME_PROP,
+        new_project: NEW_PROJECT_PROP,
         keypath: {
           type: "string",
           description:
@@ -689,7 +826,7 @@ const TOOLS: ToolDef[] = [
       if (a.list_projects) {
         return getJSON("/projects");
       }
-      const pid = resolveProject(a);
+      const pid = await resolveProject(a);
       if (a.keypath) {
         return postJSON("/keypaths", {
           project_id: pid,
@@ -745,6 +882,8 @@ const TOOLS: ToolDef[] = [
             "OMIT to use this session's default (derived from the repo name)",
         },
         scope: SCOPE_PROP,
+        project_name: PROJECT_NAME_PROP,
+        new_project: NEW_PROJECT_PROP,
         all_projects: {
           type: "boolean",
           default: false,
@@ -791,9 +930,9 @@ const TOOLS: ToolDef[] = [
       required: ["query"],
     },
     handler: async (a) => {
-      const { all_projects, ...body } = stripScope(a);
+      const { all_projects, ...body } = stripProxyFields(a);
       if (!all_projects) {
-        body.project_id = resolveProject(a);
+        body.project_id = await resolveProject(a);
       }
       const out = (await postJSON("/memories/search", body)) as {
         results?: { keypath: string }[];
@@ -824,6 +963,8 @@ const TOOLS: ToolDef[] = [
             "OMIT to use this session's default (derived from the repo name)",
         },
         scope: SCOPE_PROP,
+        project_name: PROJECT_NAME_PROP,
+        new_project: NEW_PROJECT_PROP,
         keypath: { type: "string", description: "required unless memory_id is given" },
         memory_id: {
           type: "integer",
@@ -832,10 +973,10 @@ const TOOLS: ToolDef[] = [
         },
       },
     },
-    handler: (a) => {
-      const body = stripScope(a);
+    handler: async (a) => {
+      const body = stripProxyFields(a);
       if (body.keypath) {
-        body.project_id = resolveProject(a);
+        body.project_id = await resolveProject(a);
       }
       return postJSON("/memories/history", body);
     },
@@ -857,6 +998,8 @@ const TOOLS: ToolDef[] = [
             "OMIT to use this session's default (derived from the repo name)",
         },
         scope: SCOPE_PROP,
+        project_name: PROJECT_NAME_PROP,
+        new_project: NEW_PROJECT_PROP,
         keypath: { type: "string", description: "exact keypath, or subtree root when recursive" },
         recursive: {
           type: "boolean",
@@ -866,10 +1009,10 @@ const TOOLS: ToolDef[] = [
       },
       required: ["keypath"],
     },
-    handler: (a) =>
+    handler: async (a) =>
       postJSON("/memories/delete", {
-        ...stripScope(a),
-        project_id: resolveProject(a),
+        ...stripProxyFields(a),
+        project_id: await resolveProject(a),
       }),
   },
   {
@@ -952,7 +1095,22 @@ User scope — facts that are not about this project:
   This machine's host slug is "${HOST_SLUG}". Host facts need an explicit
   keypath; heading extraction fits only "## Preferences" and "## Profile".
 - Never store secrets, tokens, or credentials in any scope. The denied-prompt
-  rule applies to the user scope too.`;
+  rule applies to the user scope too.
+
+Session project — when the prompt is not about this directory:
+- The cwd project is the default and almost always right. On the first
+  prompt the recall hook shows a <memstate-scope> block: the cwd project and
+  the other projects the prompt matches. Judge from it. When the user
+  clearly works on another subject (for example "set up my nginx config"
+  from the home directory), pin this session with project_name on your
+  first memstate call. Later calls without project_id use that project.
+  Results then carry session_project.
+- Prefer an id that memstate_get(list_projects=true) lists. A new id needs
+  new_project=true as well, and is refused when it looks like an existing
+  id ("regress_tests" vs "regress_test", "my_app_dev" vs "my_app"). Never
+  invent a variant of an existing name.
+- One pin per session; a different project_name later is an error. Pass
+  project_id to reach another project for one call.`;
 
 // ---------- main ----------
 
@@ -1002,7 +1160,7 @@ async function main(): Promise<void> {
       };
     }
     try {
-      const result = await tool.handler(request.params.arguments ?? {});
+      const result = withSessionProject(await tool.handler(request.params.arguments ?? {}));
       return {
         content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
       };

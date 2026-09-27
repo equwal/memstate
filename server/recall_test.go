@@ -269,3 +269,136 @@ func TestRunRecallUserScope(t *testing.T) {
 		t.Fatalf("more than one user slot:\n%s", text)
 	}
 }
+
+func TestProjectCandidates(t *testing.T) {
+	sem, fts := []string{"fts", "semantic"}, []string{"fts"}
+	hits := []recallHit{
+		{ProjectID: "cwd_proj", Keypath: "a", Sources: sem},
+		{ProjectID: "_user", Keypath: "preferences.x", Sources: sem},
+		{ProjectID: "nginx_server", Keypath: "a", Sources: fts},
+		{ProjectID: "nginx_server", Keypath: "b", Sources: fts},
+		{ProjectID: "weak", Keypath: "a", Sources: fts},
+		{ProjectID: "infra", Keypath: "a", Sources: sem},
+		{ProjectID: "big", Keypath: "a", Sources: fts},
+		{ProjectID: "big", Keypath: "b", Sources: fts},
+		{ProjectID: "big", Keypath: "c", Sources: fts},
+		{ProjectID: "also", Keypath: "a", Sources: sem},
+		{ProjectID: "also", Keypath: "b", Sources: sem},
+	}
+	got := projectCandidates(hits, "cwd_proj")
+	ids := make([]string, len(got))
+	for i, c := range got {
+		ids[i] = c.ProjectID
+	}
+	// cwd and _user dropped, "weak" (one fts hit) dropped, top 3 by count,
+	// ties by name.
+	if want := "big,also,nginx_server"; strings.Join(ids, ",") != want {
+		t.Fatalf("candidates %v want %s", ids, want)
+	}
+	if got[0].Hits != 3 || got[1].Semantic != true || got[2].Semantic != false {
+		t.Fatalf("candidate detail: %+v", got)
+	}
+}
+
+func TestScopeBlockText(t *testing.T) {
+	plain := t.TempDir()
+	text := scopeBlock("scratch", plain, nil)
+	if !strings.HasPrefix(text, "<memstate-scope cwd_project=\"scratch\">\n") ||
+		!strings.Contains(text, "is not a git repository ("+filepath.Base(plain)+")") ||
+		!strings.Contains(text, "matches no other project") ||
+		!strings.Contains(text, "new_project=true") ||
+		!strings.HasSuffix(text, "</memstate-scope>\n") {
+		t.Fatalf("plain dir block:\n%s", text)
+	}
+	home, err := os.UserHomeDir()
+	if err == nil {
+		if got := scopeBlock("me", home, nil); !strings.Contains(got, "(home directory)") {
+			t.Fatalf("home block:\n%s", got)
+		}
+	}
+	cands := []projectCandidate{{"nginx_server", 3, true}, {"infra", 2, false}, {"one", 1, true}}
+	text = scopeBlock("me", plain, cands)
+	if !strings.Contains(text, "Prompt matches other projects: nginx_server (3 hits, semantic), infra (2 hits), one (1 hit, semantic).") {
+		t.Fatalf("candidates line:\n%s", text)
+	}
+
+	repo := filepath.Join(t.TempDir(), "Repo.Name")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "-C", repo, "init", "-q").CombinedOutput(); err != nil {
+		t.Skipf("git init unavailable: %v %s", err, out)
+	}
+	if got := scopeBlock("repo_name", repo, nil); !strings.Contains(got, "is the git repository Repo.Name.") {
+		t.Fatalf("repo block:\n%s", got)
+	}
+}
+
+func TestScopeBlockFirstPromptOnly(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("MEMSTATE_DB", filepath.Join(dir, "t.db"))
+	t.Setenv("MEMSTATE_NO_RECALL", "")
+	ts := newTestServer(t)
+	t.Setenv("MEMSTATE_ADDR", strings.TrimPrefix(ts.URL, "http://"))
+
+	cwd := filepath.Join(t.TempDir(), "scratch")
+	if err := os.Mkdir(cwd, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	seed := func(project, kp, content string) {
+		t.Helper()
+		code, out := postJSON(t, ts.URL+"/api/v1/memories/store", map[string]any{
+			"project_id": project, "keypath": kp, "content": content,
+		})
+		if code != 200 {
+			t.Fatalf("seed: %d %v", code, out)
+		}
+	}
+	seed("nginx_server", "config.sites", "the nginx config for the sites lives in sites-enabled")
+	seed("nginx_server", "config.tls", "nginx config uses certbot for tls")
+	seed("scratch", "notes.x", "the nginx config note in the scratch project")
+	seed("lonely", "notes.y", "one nginx config mention only")
+
+	run := func(session, prompt string) string {
+		var out bytes.Buffer
+		event := `{"session_id":` + jsonString(session) + `,"cwd":` + jsonString(cwd) +
+			`,"prompt":` + jsonString(prompt) + `}`
+		if code := runRecall(strings.NewReader(event), &out); code != 0 {
+			t.Fatalf("exit %d", code)
+		}
+		return out.String()
+	}
+	first := run("sc1", "help me set up my nginx config")
+	if !strings.Contains(first, `<memstate-scope cwd_project="scratch">`) ||
+		!strings.Contains(first, "nginx_server (2 hits") ||
+		strings.Contains(first, "lonely") ||
+		!strings.Contains(first, `<memstate-recall project="scratch">`) {
+		t.Fatalf("first prompt:\n%s", first)
+	}
+	if strings.Index(first, "<memstate-scope") > strings.Index(first, "<memstate-recall") {
+		t.Fatalf("scope block must come first:\n%s", first)
+	}
+	second := run("sc1", "more about the nginx config please")
+	if strings.Contains(second, "<memstate-scope") {
+		t.Fatalf("scope block repeated in the same session:\n%s", second)
+	}
+	if again := run("sc2", "help me set up my nginx config"); !strings.Contains(again, "<memstate-scope") {
+		t.Fatalf("a new session must get the scope block:\n%s", again)
+	}
+	seen := loadSeen(recallSeenPath("sc1"))
+	if !seen[scopeMarker] || !seen["notes.x"] {
+		t.Fatalf("seen file: %v", seen)
+	}
+	// A cwd whose project has no memories still gets the block.
+	empty := filepath.Join(t.TempDir(), "nothing_here")
+	if err := os.Mkdir(empty, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	event := `{"session_id":"sc3","cwd":` + jsonString(empty) + `,"prompt":"help me set up my nginx config"}`
+	runRecall(strings.NewReader(event), &out)
+	if !strings.Contains(out.String(), `<memstate-scope cwd_project="nothing_here">`) ||
+		strings.Contains(out.String(), "<memstate-recall") {
+		t.Fatalf("empty project first prompt:\n%s", out.String())
+	}
+}

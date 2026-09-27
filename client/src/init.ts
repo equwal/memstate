@@ -68,6 +68,16 @@ daemon allows only these keypath shapes there and rejects the rest:
 \`host.<host_slug>.tools.<topic>\`. \`memstate_get()\` returns the user scope
 under \`user\` next to the project tree. Never store secrets there.
 
+## Session project
+
+The project defaults to the repository you are in, and that is almost
+always right. When the prompt is clearly about another subject (for example
+"set up my nginx config" from the home directory), pin the session once
+with \`project_name\` on your first memstate call. Prefer an id that
+\`memstate_get(list_projects=true)\` lists. A new id also needs
+\`new_project=true\` and is refused when it looks like an existing id. Never
+invent a variant of an existing name.
+
 ## Tools
 
 | Tool | When to use |

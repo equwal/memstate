@@ -121,6 +121,17 @@ an explicit `--keypath`. One bad section rejects the whole call.
 Never store secrets, tokens, or credentials in any scope. The
 denied-prompt rule applies to the user scope too.
 
+## Session project (MCP sessions only)
+
+The MCP proxy defaults every call to the repository of its working
+directory, and that is almost always right. When the prompt is clearly
+about another subject (for example "set up my nginx config" from the home
+directory), the agent pins its session once with `project_name` on the
+first tool call. An existing id pins freely. A new id also needs
+`new_project=true` and is refused when it looks like an existing id
+(`regress_tests` vs `regress_test`). One pin per session. These scripts
+are one-shot and have no session: pass `--project` instead.
+
 ## Workflows
 
 ### Before starting a task (recall)
