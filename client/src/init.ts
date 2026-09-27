@@ -52,6 +52,11 @@ memstate_remember(
 )
 \`\`\`
 
+Never save a denied prompt, for any reason. A denied prompt is a tool call
+that the user or a permission check denied. Do not save its tool name, its
+command, its arguments, or the fact of the denial. Do not save it under any
+keypath or category, in a task summary, or as a warning for a later session.
+
 ## Tools
 
 | Tool | When to use |

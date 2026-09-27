@@ -172,6 +172,7 @@ A useful agent loop:
 
 - At task start, call `memstate_get()` to load the tree. The proxy derives the project id from the repository name. Call `memstate_search(query=...)` when you do not know the exact keypath.
 - At task end, call `memstate_remember(content="## Summary\n...\n## Decisions\n...")` and let the server extract the sections.
+- Never save a denied prompt. A denied prompt is a tool call that the user or a permission check denied.
 
 `node client/dist/index.js init` writes rule files for several agents
 (`CLAUDE.md`, `AGENTS.md`, `.cursor/rules/`, and more). These files
