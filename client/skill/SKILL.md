@@ -32,7 +32,7 @@ run them from there or by absolute path.
 
 | Concept | Description |
 |---|---|
-| **Project** | Top-level container for memories, keyed by `project_id`. Auto-created on first write. |
+| **Project** | Top-level container for memories, keyed by `project_id`. Any named subject of work: a repository, a product, a topic, a machine. Not tied to a folder. Auto-created on first write. |
 | **Keypath** | Dot-separated path (`decisions.auth_provider`) unique within a project. Stored exactly as you write it. Nothing is auto-prefixed. |
 | **Memory** | One fact or markdown section stored at a keypath, with full version history. Memory ids are integers. |
 | **Versioning** | A write to an existing keypath supersedes the old value. The response returns the old version as `superseded`. Writes are synchronous. Data is queryable when the script returns. |
@@ -42,13 +42,13 @@ run them from there or by absolute path.
 
 Every deviation fragments the store into disconnected near-duplicates.
 
-- **project_id**: Omit `--project`. Every script derives the default
-  from the git repository name (or the directory basename), slugged to
-  snake_case, so all sessions in one repository share one project
-  automatically. Pass `--project` only to reach a DIFFERENT project,
-  and then only an id that `memstate_get.py --list-projects` lists.
-  Never invent a variant. `my-app`, `myapp`, and `my_app_dev` are three
-  different projects.
+- **project_id**: Every script needs `--project`. The scripts do not
+  derive a project from the working folder, because a folder does not
+  always name the work. Use an id that `memstate_get.py
+  --list-projects` lists when the work belongs to that project. Use a
+  new snake_case name only for a new subject of work. Never invent a
+  variant. `my-app`, `myapp`, and `my_app_dev` are three different
+  projects.
 - **keypath segments**: Lowercase snake_case only (`[a-z0-9_]`), joined
   by dots. Dates are `YYYY_MM_DD` inside a segment:
   `task.summary.2026_07_04`. Never `2026-07-04`, camelCase, or spaces.
@@ -81,25 +81,25 @@ Every deviation fragments the store into disconnected near-duplicates.
 ### Before starting a task (recall)
 
 ```bash
-# 1. Browse this repo's keypath tree (names only, no content)
-python3 scripts/memstate_get.py
-
-# 2. Read a subtree with content
-python3 scripts/memstate_get.py --keypath decisions --include-content
-
-# 3. Search when you do not know the keypath
-python3 scripts/memstate_search.py --query "how is authentication configured"
-python3 scripts/memstate_search.py --query "auth setup" --mode semantic
-
-# Other projects: --list-projects shows ids. --project targets one.
+# 1. Find the project id of the work
 python3 scripts/memstate_get.py --list-projects
+
+# 2. Browse its keypath tree (names only, no content)
+python3 scripts/memstate_get.py --project my_app
+
+# 3. Read a subtree with content
+python3 scripts/memstate_get.py --project my_app --keypath decisions --include-content
+
+# 4. Search when you do not know the keypath
+python3 scripts/memstate_search.py --project my_app --query "how is authentication configured"
+python3 scripts/memstate_search.py --all-projects --query "auth setup" --mode semantic
 ```
 
 ### After completing a task (remember)
 
 ```bash
 # One short fact at one keypath
-python3 scripts/memstate_set.py \
+python3 scripts/memstate_set.py --project my_app \
   --keypath config.port --value "8080" --category config
 
 # Markdown summary, split by ## headings (one memory per section).
@@ -107,7 +107,7 @@ python3 scripts/memstate_set.py \
 # headings nest one more dot segment. Prose before the first ## lands
 # at `preamble`. Pass --root notes to nest sections under a prefix, or
 # --keypath to store ALL content as one memory.
-python3 scripts/memstate_remember.py \
+python3 scripts/memstate_remember.py --project my_app \
   --content "## Decisions\nSwitched JWT -> sessions.\n\n## Gotchas\nCookie must be SameSite=Lax." \
   --source "claude-code session 2026_07_04" --category note
 ```
@@ -123,10 +123,10 @@ Heading names `TODOs`, `Decisions`, `Open Questions`, `Files`,
 python3 scripts/memstate_history.py --project my_app --keypath config.port
 
 # Tombstone one keypath. History is kept. A new write revives it.
-python3 scripts/memstate_delete.py --keypath config.old_setting
+python3 scripts/memstate_delete.py --project my_app --keypath config.old_setting
 
 # Tombstone a whole subtree, e.g. a merged branch's state
-python3 scripts/memstate_delete.py --keypath branches.feature_foo_bar --recursive
+python3 scripts/memstate_delete.py --project my_app --keypath branches.feature_foo_bar --recursive
 
 # Soft-delete a project (any later write to the same id revives it)
 python3 scripts/memstate_delete_project.py --project my_app
@@ -138,8 +138,8 @@ python3 scripts/memstate_delete_project.py --project my_app
 
 ```bash
 python3 scripts/memstate_set.py \
-  --keypath KEYPATH --value VALUE \
-  [--project ID] [--source TEXT] [--category WORD] [--topics TAG1,TAG2]
+  --project ID --keypath KEYPATH --value VALUE \
+  [--source TEXT] [--category WORD] [--topics TAG1,TAG2]
 ```
 
 **Response:** `action` (`created` | `superseded` | `unchanged`),
@@ -151,8 +151,7 @@ written.
 
 ```bash
 python3 scripts/memstate_remember.py \
-  --content "MARKDOWN" \
-  [--project ID]
+  --project ID --content "MARKDOWN" \
   [--keypath KEYPATH]        # store everything as ONE memory here
   [--root PREFIX]            # heading-split mode: nest sections under this prefix (default: none)
   [--source TEXT] [--category WORD] [--topics TAG1,TAG2]
@@ -166,10 +165,9 @@ queue. The operation is synchronous. **Response:** `method`
 ### `memstate_get.py`: browse and retrieve
 
 ```bash
-python3 scripts/memstate_get.py                               # this repo's tree (names only)
-python3 scripts/memstate_get.py --keypath KP --include-content
 python3 scripts/memstate_get.py --list-projects               # all project ids
-python3 scripts/memstate_get.py --project ID --keypath KP     # another project
+python3 scripts/memstate_get.py --project ID                  # project tree (names only)
+python3 scripts/memstate_get.py --project ID --keypath KP --include-content
 python3 scripts/memstate_get.py --memory-id N                 # one memory by integer id
 ```
 
@@ -182,8 +180,7 @@ python3 scripts/memstate_get.py --memory-id N                 # one memory by in
 
 ```bash
 python3 scripts/memstate_search.py --query "PLAIN WORDS" \
-  [--project ID]             # default: this repo's project
-  [--all-projects]           # search the whole store
+  --project ID | --all-projects   # one project, or the whole store
   [--mode hybrid|fts|semantic]  # hybrid (default) = any word + meaning, fused; fts = every word; semantic = meaning only (needs Ollama)
   [--threshold 0.0-1.0]      # semantic and hybrid, default 0.5
   [--category WORD] [--topics TAG1,TAG2]   # topics = match any
@@ -202,7 +199,7 @@ unavailable and only FTS hits are present).
 ### `memstate_history.py`: version chain of one keypath
 
 ```bash
-python3 scripts/memstate_history.py --keypath KP [--project ID]
+python3 scripts/memstate_history.py --project ID --keypath KP
 python3 scripts/memstate_history.py --memory-id N
 ```
 
@@ -212,7 +209,7 @@ python3 scripts/memstate_history.py --memory-id N
 ### `memstate_delete.py`: tombstone keypath(s)
 
 ```bash
-python3 scripts/memstate_delete.py --keypath KP [--project ID] [--recursive]
+python3 scripts/memstate_delete.py --project ID --keypath KP [--recursive]
 ```
 
 **Response:** `deleted_count`, `deleted_keypaths[]`.
@@ -228,9 +225,9 @@ Any write to the same project_id revives it with all memories intact.
 
 ## Best practices
 
-1. **Let the default id work.** Omit `--project`. The repo-derived
-   default keeps every session in one repo on one project. Only pass
-   an explicit id that `--list-projects` shows.
+1. **Reuse project ids.** Pass an id that `--list-projects` shows
+   when the work belongs to that project. Make a new id only for a new
+   subject of work.
 2. **Update, do not duplicate.** Same keypath, new value. The version
    chain is the changelog.
 3. **Search before browsing.** `memstate_search.py` beats a walk of

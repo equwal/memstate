@@ -3,19 +3,19 @@
 import argparse
 import sys
 
-from _client import default_project, post
+from _client import require_project, post
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Soft-delete a keypath")
     ap.add_argument("--project", default=None,
-                    help="project id (default: derived from repo/dir name)")
+                    help="project id (required: the scripts do not derive one)")
     ap.add_argument("--keypath", required=True)
     ap.add_argument("--recursive", action="store_true")
     args = ap.parse_args()
 
     return post("/memories/delete", {
-        "project_id": args.project or default_project(),
+        "project_id": require_project(args.project),
         "keypath": args.keypath,
         "recursive": args.recursive,
     })

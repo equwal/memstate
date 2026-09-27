@@ -3,13 +3,13 @@
 import argparse
 import sys
 
-from _client import default_project, post
+from _client import require_project, post
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="View version history for a keypath")
     ap.add_argument("--project", default=None,
-                    help="project id (default: derived from repo/dir name)")
+                    help="project id (required: the scripts do not derive one)")
     ap.add_argument("--keypath")
     ap.add_argument("--memory-id", type=int)
     args = ap.parse_args()
@@ -17,7 +17,7 @@ def main() -> int:
     if args.memory_id is not None:
         body = {"memory_id": args.memory_id}
     elif args.keypath:
-        body = {"project_id": args.project or default_project(), "keypath": args.keypath}
+        body = {"project_id": require_project(args.project), "keypath": args.keypath}
     else:
         print("Error: provide --memory-id OR --keypath", file=sys.stderr)
         return 1

@@ -2,23 +2,22 @@
 """Browse and retrieve memories from the memstated daemon.
 
 Usage:
-  memstate_get.py                                    # This repo's tree (names only)
   memstate_get.py --list-projects                    # List all project ids
-  memstate_get.py --keypath db --include-content    # Subtree with content
-  memstate_get.py --project other_app --keypath db  # Another project's subtree
+  memstate_get.py --project my_app                   # Project tree (names only)
+  memstate_get.py --project my_app --keypath db --include-content  # Subtree with content
   memstate_get.py --memory-id 42                     # Single memory by numeric ID
 """
 import argparse
 import sys
 import urllib.parse
 
-from _client import default_project, get, post
+from _client import require_project, get, post
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Browse and retrieve memories (server)")
     ap.add_argument("--project", default=None,
-                    help="project id (default: derived from repo/dir name)")
+                    help="project id (required: the scripts do not derive one)")
     ap.add_argument("--list-projects", action="store_true",
                     help="list every project id in the store")
     ap.add_argument("--keypath")
@@ -32,7 +31,7 @@ def main() -> int:
     if args.memory_id is not None:
         return get(f"/memories/{args.memory_id}")
 
-    project = args.project or default_project()
+    project = require_project(args.project)
     if args.keypath:
         body = {
             "project_id": project,

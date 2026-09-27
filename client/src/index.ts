@@ -17,7 +17,7 @@
  *   MEMSTATE_BIN         path to memstated (default: sibling build / PATH)
  *   MEMSTATE_LOCAL_URL   full base URL override
  */
-import { spawn, execSync, ChildProcess } from "child_process";
+import { spawn, ChildProcess } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -82,32 +82,73 @@ let daemonAddr = ""; // resolved after ensureDaemon()
 let baseURL = "";
 let managedChild: ChildProcess | null = null;
 
-// deriveProjectId computes the session's default project_id from the git
-// repo name (or the working directory's basename outside a repo), slugged
-// to lowercase snake_case. MCP clients spawn this proxy in the project
-// directory, so this pins one stable id per repo and stops callers from
-// inventing near-duplicate ids.
-function deriveProjectId(): string {
-  let base = "";
-  try {
-    const top = execSync("git rev-parse --show-toplevel", {
-      stdio: ["ignore", "pipe", "ignore"],
-    })
-      .toString()
-      .trim();
-    if (top) base = path.basename(top);
-  } catch {
-    /* not a git repo */
-  }
-  if (!base) base = path.basename(process.cwd());
-  const slug = base
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "_")
-    .replace(/^_+|_+$/g, "");
-  return slug || "default";
+// ---------- session project ----------
+//
+// A project is any named subject of work: a repository, a product, a topic,
+// a machine. The proxy does not derive one from its working folder, because
+// a folder does not always name the work. Each session names its project on
+// its first write with project_name. The name can be an existing project id
+// or a new one. Later calls without project_id use it. The name lives only in
+// this process, so a new proxy starts without one.
+
+const PROJECT_ID = /^[a-z0-9]+(_[a-z0-9]+)*$/;
+
+const NAME_RULES =
+  "project_name must be lowercase snake_case: words of a-z and 0-9 " +
+  'joined by single underscores, for example "billing_api".';
+
+const NO_PROJECT =
+  "This session has no project yet. Pass project_id, or name the session's " +
+  "project with project_name on a memstate_set or memstate_remember call. " +
+  "memstate_get(list_projects=true) shows the existing project ids.";
+
+let sessionProject = "";
+
+// readProject returns the project of a call that cannot name one.
+function readProject(a: Record<string, unknown>): string {
+  if (a.project_id) return String(a.project_id);
+  if (!sessionProject) throw new Error(NO_PROJECT);
+  return sessionProject;
 }
 
-const DEFAULT_PROJECT = deriveProjectId();
+// writeProject returns the project of a set or remember call. A project_name
+// names the session's project once; a different name later is an error.
+function writeProject(a: Record<string, unknown>): string {
+  const name = a.project_name;
+  if (name !== undefined) {
+    if (typeof name !== "string" || !PROJECT_ID.test(name)) {
+      throw new Error(NAME_RULES);
+    }
+    if (sessionProject && name !== sessionProject) {
+      throw new Error(
+        `this session's project is already "${sessionProject}"; omit ` +
+          "project_name, or pass project_id to write to another project"
+      );
+    }
+    sessionProject = name;
+  }
+  return readProject(a);
+}
+
+// PROJECT_NAME_PROPERTY is the project_name argument of the write tools.
+const PROJECT_NAME_PROPERTY = {
+  type: "string",
+  description:
+    "Names this session's project, once, on the first write without " +
+    "project_id: an id from memstate_get(list_projects=true) when the work " +
+    "belongs to an existing project, else a new lowercase snake_case name " +
+    "for the subject of the work.",
+};
+
+// PROJECT_ID_PROPERTY is the project_id argument of the tools that default
+// to the session's project.
+const PROJECT_ID_PROPERTY = {
+  type: "string",
+  description:
+    "OMIT to use this session's project (named by project_name on the " +
+    "first write). Only pass an id that memstate_get(list_projects=true) " +
+    "lists — never invent a variant.",
+};
 
 // ---------- daemon lifecycle ----------
 
@@ -410,13 +451,7 @@ const TOOLS: ToolDef[] = [
     inputSchema: {
       type: "object",
       properties: {
-        project_id: {
-          type: "string",
-          description:
-            "OMIT to use this session's default (derived from the repo " +
-            "name). Only pass an id that memstate_get(list_projects=true) " +
-            "lists — never invent a variant.",
-        },
+        project_id: PROJECT_ID_PROPERTY,
         keypath: {
           type: "string",
           description:
@@ -449,12 +484,13 @@ const TOOLS: ToolDef[] = [
             "subject tags, lowercase snake_case, e.g. [\"auth\", " +
             "\"embeddings\"]. Search matches ANY listed topic.",
         },
+        project_name: PROJECT_NAME_PROPERTY,
       },
       required: ["keypath", "value"],
     },
     handler: (a) =>
       postJSON("/memories/store", {
-        project_id: a.project_id || DEFAULT_PROJECT,
+        project_id: writeProject(a),
         keypath: a.keypath,
         content: a.value,
         source: a.source,
@@ -477,13 +513,7 @@ const TOOLS: ToolDef[] = [
     inputSchema: {
       type: "object",
       properties: {
-        project_id: {
-          type: "string",
-          description:
-            "OMIT to use this session's default (derived from the repo " +
-            "name). Only pass an id that memstate_get(list_projects=true) " +
-            "lists — never invent a variant.",
-        },
+        project_id: PROJECT_ID_PROPERTY,
         keypath: {
           type: "string",
           description:
@@ -519,30 +549,29 @@ const TOOLS: ToolDef[] = [
             "keypaths, e.g. \"notes\" stores `## Auth` at `notes.auth`. " +
             "Default is none — sections are stored at the top level.",
         },
+        project_name: PROJECT_NAME_PROPERTY,
       },
       required: ["content"],
     },
-    handler: (a) =>
-      postJSON("/memories/remember", {
-        ...a,
-        project_id: a.project_id || DEFAULT_PROJECT,
-      }),
+    handler: (a) => {
+      // The daemon rejects unknown fields, and project_name is proxy-only.
+      const body: Record<string, unknown> = { ...a };
+      delete body.project_name;
+      body.project_id = writeProject(a);
+      return postJSON("/memories/remember", body);
+    },
   },
   {
     name: "memstate_get",
     description:
-      "Read memories. No arguments → this repo's keypath tree (NAMES " +
+      "Read memories. No keypath → the project's keypath tree (NAMES " +
       "ONLY, no content); pass `keypath` → the memories at that keypath " +
       "and below, with content; pass `list_projects: true` → all project " +
       "ids in the store. Call at task start to load prior context.",
     inputSchema: {
       type: "object",
       properties: {
-        project_id: {
-          type: "string",
-          description:
-            "OMIT to use this session's default (derived from the repo name)",
-        },
+        project_id: PROJECT_ID_PROPERTY,
         keypath: {
           type: "string",
           description:
@@ -563,7 +592,7 @@ const TOOLS: ToolDef[] = [
       if (a.list_projects) {
         return getJSON("/projects");
       }
-      const pid = String(a.project_id || DEFAULT_PROJECT);
+      const pid = readProject(a);
       if (a.keypath) {
         return postJSON("/keypaths", {
           project_id: pid,
@@ -580,8 +609,8 @@ const TOOLS: ToolDef[] = [
     description:
       "Find current memories when you don't know the exact keypath. Only " +
       "the latest version of each keypath is searched; deleted keypaths " +
-      "and deleted projects never match. Searches this repo's project by " +
-      "default; pass all_projects=true to search the whole store.",
+      "and deleted projects never match. Searches this session's project " +
+      "by default; pass all_projects=true to search the whole store.",
     inputSchema: {
       type: "object",
       properties: {
@@ -591,15 +620,11 @@ const TOOLS: ToolDef[] = [
             "plain words — no quoting or boolean operators needed; " +
             "punctuation is handled",
         },
-        project_id: {
-          type: "string",
-          description:
-            "OMIT to use this session's default (derived from the repo name)",
-        },
+        project_id: PROJECT_ID_PROPERTY,
         all_projects: {
           type: "boolean",
           default: false,
-          description: "search every project in the store instead of just this repo's",
+          description: "search every project in the store instead of one",
         },
         limit: { type: "integer", default: 20 },
         mode: {
@@ -643,9 +668,7 @@ const TOOLS: ToolDef[] = [
     },
     handler: (a) => {
       const { all_projects, ...body } = a;
-      if (!all_projects && !body.project_id) {
-        body.project_id = DEFAULT_PROJECT;
-      }
+      if (!all_projects) body.project_id = readProject(body);
       return postJSON("/memories/search", body);
     },
   },
@@ -655,16 +678,12 @@ const TOOLS: ToolDef[] = [
       "Every stored version of ONE keypath, newest first, including " +
       "tombstones. Use to see what a fact was before it changed. Identify " +
       "the keypath either by `keypath` (project_id defaults to this " +
-      "repo's), or by the integer `id` of any memory in the chain (from a " +
-      "previous response).",
+      "session's project), or by the integer `id` of any memory in the " +
+      "chain (from a previous response).",
     inputSchema: {
       type: "object",
       properties: {
-        project_id: {
-          type: "string",
-          description:
-            "OMIT to use this session's default (derived from the repo name)",
-        },
+        project_id: PROJECT_ID_PROPERTY,
         keypath: { type: "string", description: "required unless memory_id is given" },
         memory_id: {
           type: "integer",
@@ -675,9 +694,7 @@ const TOOLS: ToolDef[] = [
     },
     handler: (a) => {
       const body = { ...a };
-      if (body.keypath && !body.project_id) {
-        body.project_id = DEFAULT_PROJECT;
-      }
+      if (body.keypath) body.project_id = readProject(body);
       return postJSON("/memories/history", body);
     },
   },
@@ -692,11 +709,7 @@ const TOOLS: ToolDef[] = [
     inputSchema: {
       type: "object",
       properties: {
-        project_id: {
-          type: "string",
-          description:
-            "OMIT to use this session's default (derived from the repo name)",
-        },
+        project_id: PROJECT_ID_PROPERTY,
         keypath: { type: "string", description: "exact keypath, or subtree root when recursive" },
         recursive: {
           type: "boolean",
@@ -709,7 +722,7 @@ const TOOLS: ToolDef[] = [
     handler: (a) =>
       postJSON("/memories/delete", {
         ...a,
-        project_id: a.project_id || DEFAULT_PROJECT,
+        project_id: readProject(a),
       }),
   },
   {
@@ -727,10 +740,19 @@ const TOOLS: ToolDef[] = [
   },
 ];
 
-const INSTRUCTIONS = `memstate — persistent memory across sessions, scoped per project.
+const INSTRUCTIONS = `memstate — persistent memory across sessions, kept in named projects.
+
+A project is any named subject of work: a repository, a product, a topic, a
+machine. It is not tied to a folder, and this session has no project until
+it names one. Name it on the first memstate_set or memstate_remember call
+without project_id: pass project_name = an id that
+memstate_get(list_projects=true) lists when the work belongs to that
+project, else a new short snake_case name for the subject of the work.
+Later calls without project_id use that project.
 
 When to use:
-- Task start: memstate_get(project_id=...) to load prior context.
+- Task start: memstate_get(list_projects=true), then
+  memstate_get(project_id=...) to load prior context.
 - Task end: memstate_remember to save decisions, progress, and key facts.
 - Mid-task: memstate_search when you suspect prior context exists but don't
   know the keypath; memstate_set for single-fact updates (config, status).
@@ -739,12 +761,11 @@ Writes are versioned: writing an existing keypath supersedes the old value
 and returns it to you, so you see what changed. Deletes keep history.
 
 Conventions — follow these EXACTLY; every deviation fragments the store:
-- project_id: OMIT it. This session's default is "${DEFAULT_PROJECT}"
-  (derived from the repo/directory name) and is used whenever project_id
-  is absent. Only pass project_id to reach a DIFFERENT project, and then
-  only an id that memstate_get(list_projects=true) actually lists — NEVER
-  invent a variant: "my-app", "myapp", and "my_app_dev" each create a
-  separate, disconnected project.
+- project_id: OMIT it after the session names its project. Only pass
+  project_id to reach a DIFFERENT project, and then only an id that
+  memstate_get(list_projects=true) actually lists — NEVER invent a
+  variant: "my-app", "myapp", and "my_app_dev" each create a separate,
+  disconnected project.
 - keypath segments: lowercase snake_case only ([a-z0-9_]), joined by dots.
   Dates are YYYY_MM_DD inside a segment: "task.summary.2026_07_03" — never
   "2026-07-03" (kebab) and never camelCase or spaces anywhere.

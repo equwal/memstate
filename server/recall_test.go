@@ -4,9 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -14,90 +12,82 @@ import (
 	"pgregory.net/rapid"
 )
 
-func TestSlugProjectProperties(t *testing.T) {
-	valid := regexp.MustCompile(`^[a-z0-9_]+$`)
-	rapid.Check(t, func(t *rapid.T) {
-		name := rapid.String().Draw(t, "name")
-		s := slugProject(name)
-		if !valid.MatchString(s) {
-			t.Fatalf("slug %q of %q has characters outside [a-z0-9_]", s, name)
-		}
-		if strings.HasPrefix(s, "_") || strings.HasSuffix(s, "_") {
-			t.Fatalf("slug %q of %q has an edge underscore", s, name)
-		}
-		if again := slugProject(s); again != s {
-			t.Fatalf("slug is not idempotent: %q -> %q", s, again)
-		}
-	})
-}
-
-func TestDeriveProject(t *testing.T) {
-	// Non-repository directory: its own name, slugged.
-	plain := filepath.Join(t.TempDir(), "My-App v2")
-	if err := os.Mkdir(plain, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if got := deriveProject(plain); got != "my_app_v2" {
-		t.Fatalf("plain dir: got %q want my_app_v2", got)
-	}
-	if got := deriveProject(""); got != "default" {
-		t.Fatalf("empty cwd: got %q want default", got)
-	}
-
-	// Repository: the top-level name wins even from a nested directory.
-	repo := filepath.Join(t.TempDir(), "Repo.Name")
-	nested := filepath.Join(repo, "sub", "dir")
-	if err := os.MkdirAll(nested, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if out, err := exec.Command("git", "-C", repo, "init", "-q").CombinedOutput(); err != nil {
-		t.Skipf("git init unavailable: %v %s", err, out)
-	}
-	if got := deriveProject(nested); got != "repo_name" {
-		t.Fatalf("nested repo dir: got %q want repo_name", got)
-	}
-}
-
 func TestRenderRecall(t *testing.T) {
 	long := strings.Repeat("x", 600)
 	fts, both := []string{"fts"}, []string{"fts", "semantic"}
 	hits := []recallHit{
-		{Keypath: "a", Content: "seen already", Sources: both},
-		{Keypath: "b", Content: long, Category: "gotcha", Sources: fts},
-		{Keypath: "c", Content: "  short  ", Sources: fts},
-		{Keypath: "d", Content: "fourth", Sources: both},
-		{Keypath: "e", Content: "fifth", Sources: both},
+		{ProjectID: "p", Keypath: "a", Content: "seen already", Sources: both},
+		{ProjectID: "p", Keypath: "b", Content: long, Category: "gotcha", Sources: fts},
+		{ProjectID: "q", Keypath: "c", Content: "  short  ", Sources: fts},
+		{ProjectID: "p", Keypath: "d", Content: "fourth", Sources: both},
+		{ProjectID: "p", Keypath: "e", Content: "fifth", Sources: both},
 	}
-	text, shown := renderRecall("proj", hits, map[string]bool{"a": true}, 3, 500)
-	if want := []string{"b", "c", "d"}; strings.Join(shown, ",") != strings.Join(want, ",") {
+	seen := map[string]bool{"p:a": true}
+	text, shown := renderRecall(hits, seen, 3, 500)
+	if want := "p:b,q:c,p:d"; strings.Join(shown, ",") != want {
 		t.Fatalf("shown = %v want %v", shown, want)
 	}
 	// A hit below the cap fills a freed slot only with a semantic source.
 	hits[3].Sources = fts
-	if _, shown := renderRecall("proj", hits, map[string]bool{"a": true}, 3, 500); strings.Join(shown, ",") != "b,c,e" {
+	if _, shown := renderRecall(hits, seen, 3, 500); strings.Join(shown, ",") != "p:b,q:c,p:e" {
 		t.Fatalf("fts-only backfill must be skipped, semantic backfill taken: shown = %v", shown)
 	}
 	hits[4].Sources = fts
-	if _, shown := renderRecall("proj", hits, map[string]bool{"a": true}, 3, 500); strings.Join(shown, ",") != "b,c" {
+	if _, shown := renderRecall(hits, seen, 3, 500); strings.Join(shown, ",") != "p:b,q:c" {
 		t.Fatalf("no semantic candidates below the cap: shown = %v", shown)
 	}
 	hits[3].Sources = both
-	if !strings.HasPrefix(text, "<memstate-recall project=\"proj\">\n") ||
+	if !strings.HasPrefix(text, "<memstate-recall>\n") ||
 		!strings.HasSuffix(text, "</memstate-recall>\n") {
 		t.Fatalf("block markers missing:\n%s", text)
 	}
 	if strings.Contains(text, "seen already") || strings.Contains(text, "fifth") {
 		t.Fatalf("seen or over-cap hit leaked:\n%s", text)
 	}
-	if !strings.Contains(text, "### b [gotcha]\n"+strings.Repeat("x", 500)+"[…truncated]\n") {
+	if !strings.Contains(text, "### p:b [gotcha]\n"+strings.Repeat("x", 500)+"[…truncated]\n") {
 		t.Fatalf("truncation or category header wrong:\n%s", text)
 	}
-	if !strings.Contains(text, "### c\nshort\n") {
+	if !strings.Contains(text, "### q:c\nshort\n") {
 		t.Fatalf("content should be trimmed:\n%s", text)
 	}
-	if text, shown := renderRecall("proj", hits[:1], map[string]bool{"a": true}, 3, 500); text != "" || shown != nil {
+	// The same keypath in another project is a different memory.
+	if _, shown := renderRecall([]recallHit{{ProjectID: "q", Keypath: "a", Sources: both}}, seen, 3, 500); strings.Join(shown, ",") != "q:a" {
+		t.Fatalf("a seen keypath of one project must not hide another project's: shown = %v", shown)
+	}
+	if text, shown := renderRecall(hits[:1], seen, 3, 500); text != "" || shown != nil {
 		t.Fatalf("all-seen must render nothing, got %q %v", text, shown)
 	}
+}
+
+func TestRenderRecallProperties(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		id := rapid.StringMatching(`[a-c]`)
+		hits := rapid.SliceOf(rapid.Custom(func(t *rapid.T) recallHit {
+			return recallHit{
+				ProjectID: id.Draw(t, "project"),
+				Keypath:   id.Draw(t, "keypath"),
+				Content:   rapid.String().Draw(t, "content"),
+				Sources:   rapid.SampledFrom([][]string{{"fts"}, {"fts", "semantic"}}).Draw(t, "sources"),
+			}
+		})).Draw(t, "hits")
+		seen := map[string]bool{}
+		for _, key := range rapid.SliceOf(rapid.StringMatching(`[a-c]:[a-c]`)).Draw(t, "seen") {
+			seen[key] = true
+		}
+		maxHits := rapid.IntRange(1, 5).Draw(t, "maxHits")
+		text, shown := renderRecall(hits, seen, maxHits, 50)
+		if len(shown) > maxHits {
+			t.Fatalf("shown %d hits, cap is %d", len(shown), maxHits)
+		}
+		if (text == "") != (len(shown) == 0) {
+			t.Fatalf("text and shown disagree: %q %v", text, shown)
+		}
+		for _, key := range shown {
+			if seen[key] {
+				t.Fatalf("seen key %q shown again", key)
+			}
+		}
+	})
 }
 
 func TestRunRecallEndToEnd(t *testing.T) {
@@ -108,13 +98,18 @@ func TestRunRecallEndToEnd(t *testing.T) {
 	ts := newTestServer(t)
 	t.Setenv("MEMSTATE_ADDR", strings.TrimPrefix(ts.URL, "http://"))
 
-	cwd := filepath.Join(t.TempDir(), "recall-proj")
+	// The folder name matches no project: recall must not depend on it.
+	cwd := filepath.Join(t.TempDir(), "unrelated-folder")
 	if err := os.Mkdir(cwd, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	postJSON(t, ts.URL+"/api/v1/memories/remember", map[string]any{
 		"project_id": "recall_proj", "keypath": "gotchas.timeout",
 		"content": "the embed timeout must cover a cold model load", "category": "gotcha",
+	})
+	postJSON(t, ts.URL+"/api/v1/memories/remember", map[string]any{
+		"project_id": "other_proj", "keypath": "notes.cold",
+		"content": "a cold model load takes a long embed timeout",
 	})
 
 	run := func(event string) string {
@@ -128,9 +123,10 @@ func TestRunRecallEndToEnd(t *testing.T) {
 		`,"prompt":"why does the embed timeout matter for cold loads"}`
 
 	first := run(event)
-	if !strings.Contains(first, `<memstate-recall project="recall_proj">`) ||
-		!strings.Contains(first, "### gotchas.timeout [gotcha]") {
-		t.Fatalf("first prompt should inject the hit, got:\n%s", first)
+	if !strings.Contains(first, "<memstate-recall>") ||
+		!strings.Contains(first, "### recall_proj:gotchas.timeout [gotcha]") ||
+		!strings.Contains(first, "### other_proj:notes.cold") {
+		t.Fatalf("first prompt should inject the hits of both projects, got:\n%s", first)
 	}
 	if second := run(event); second != "" {
 		t.Fatalf("same session must not repeat a keypath, got:\n%s", second)

@@ -153,10 +153,15 @@ and the seven tool names, and exits cleanly.
 
 ## The seven tools
 
-Every tool is scoped by `project_id`. The proxy derives the default id
-from the git repository name (the directory basename outside a
-repository), slugged to snake_case. Omit `project_id` in tool calls.
-Pass it only to reach a different project. Keypaths use dot notation.
+Every tool is scoped by `project_id`. A project is any named subject of
+work: a repository, a product, a topic, a machine. The proxy does not
+derive a project from its working folder, because a folder does not
+always name the work. A session names its project once, with
+`project_name` on its first `memstate_set` or `memstate_remember` call.
+The name can be an existing project id or a new snake_case name. Later
+calls omit `project_id` and use that project. Pass `project_id` only to
+reach a different project. The name lives in the proxy process, so a new
+proxy starts without one. Keypaths use dot notation.
 
 | Tool | Purpose |
 |---|---|
@@ -170,8 +175,8 @@ Pass it only to reach a different project. Keypaths use dot notation.
 
 A useful agent loop:
 
-- At task start, call `memstate_get()` to load the tree. The proxy derives the project id from the repository name. Call `memstate_search(query=...)` when you do not know the exact keypath.
-- At task end, call `memstate_remember(content="## Summary\n...\n## Decisions\n...")` and let the server extract the sections.
+- At task start, call `memstate_get(list_projects=true)`, then `memstate_get(project_id=...)` to load the tree of the project that the work belongs to. Call `memstate_search(query=...)` when you do not know the exact keypath.
+- At task end, call `memstate_remember(content="## Summary\n...\n## Decisions\n...", project_name=...)` and let the server extract the sections. The first write of a session names its project; later calls can omit it.
 
 `node client/dist/index.js init` writes rule files for several agents
 (`CLAUDE.md`, `AGENTS.md`, `.cursor/rules/`, and more). These files

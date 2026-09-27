@@ -7,7 +7,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -16,10 +15,12 @@ import (
 )
 
 // `memstated recall` is the UserPromptSubmit hook for Claude Code. It reads
-// the hook event on stdin, searches the project's memories with the prompt
-// text, and prints the best unseen hits so they land in the model's context
-// before it answers. Every failure path exits 0 with nothing on stdout: a
-// hook that fails must never block the prompt.
+// the hook event on stdin, searches the memories of all projects with the
+// prompt text, and prints the best unseen hits so they land in the model's
+// context before it answers. It does not derive a project from the working
+// folder, because a folder does not always name the work. Every failure path
+// exits 0 with nothing on stdout: a hook that fails must never block the
+// prompt.
 
 const (
 	recallMinWords  = 4   // shorter prompts ("yes", "continue") carry no topic
@@ -32,21 +33,24 @@ const (
 
 type hookEvent struct {
 	SessionID string `json:"session_id"`
-	Cwd       string `json:"cwd"`
 	Prompt    string `json:"prompt"`
 }
 
 type recallHit struct {
-	Keypath  string   `json:"keypath"`
-	Content  string   `json:"content"`
-	Category string   `json:"category"`
-	Sources  []string `json:"sources"`
+	ProjectID string   `json:"project_id"`
+	Keypath   string   `json:"keypath"`
+	Content   string   `json:"content"`
+	Category  string   `json:"category"`
+	Sources   []string `json:"sources"`
 }
 
-var (
-	slugRE      = regexp.MustCompile(`[^a-z0-9]+`)
-	sessionIDRE = regexp.MustCompile(`[^A-Za-z0-9_-]+`)
-)
+// seenKey identifies a hit in the seen file. Project ids and keypaths hold
+// no ":", so the key is unique.
+func (h recallHit) seenKey() string {
+	return h.ProjectID + ":" + h.Keypath
+}
+
+var sessionIDRE = regexp.MustCompile(`[^A-Za-z0-9_-]+`)
 
 func cmdRecall(args []string) int {
 	return runRecall(os.Stdin, os.Stdout)
@@ -75,15 +79,14 @@ func runRecall(stdin io.Reader, stdout io.Writer) int {
 		debug("no shared daemon found")
 		return 0
 	}
-	project := deriveProject(ev.Cwd)
-	hits, err := recallSearch(addr, project, ev.Prompt)
+	hits, err := recallSearch(addr, ev.Prompt)
 	if err != nil {
 		debug("search: %v", err)
 		return 0
 	}
 	seenPath := recallSeenPath(ev.SessionID)
 	seen := loadSeen(seenPath)
-	text, shown := renderRecall(project, hits, seen, recallMaxHits, recallMaxChars)
+	text, shown := renderRecall(hits, seen, recallMaxHits, recallMaxChars)
 	if text == "" {
 		return 0
 	}
@@ -100,41 +103,14 @@ func recallEligible(prompt string) bool {
 	return len(strings.Fields(prompt)) >= recallMinWords
 }
 
-// deriveProject maps a working directory to a project id with the same rule
-// as the TS proxy and the Python skill: the git repository name (the
-// directory name outside a repository), lowercased, with every run of
-// characters outside [a-z0-9] replaced by "_" and edge underscores trimmed.
-func deriveProject(cwd string) string {
-	base := ""
-	if cwd != "" {
-		out, err := exec.Command("git", "-C", cwd, "rev-parse", "--show-toplevel").Output()
-		if err == nil {
-			base = filepath.Base(strings.TrimSpace(string(out)))
-		}
-	}
-	if base == "" {
-		base = filepath.Base(cwd)
-	}
-	return slugProject(base)
-}
-
-func slugProject(name string) string {
-	s := strings.Trim(slugRE.ReplaceAllString(strings.ToLower(name), "_"), "_")
-	if s == "" {
-		return "default"
-	}
-	return s
-}
-
-// recallSearch runs a hybrid search on the daemon at addr. Any non-200
-// reply is an error, including "unknown mode" from a daemon that predates
-// hybrid search.
-func recallSearch(addr, project, prompt string) ([]recallHit, error) {
+// recallSearch runs a hybrid search over all projects on the daemon at addr.
+// Any non-200 reply is an error, including "unknown mode" from a daemon that
+// predates hybrid search.
+func recallSearch(addr, prompt string) ([]recallHit, error) {
 	body, _ := json.Marshal(map[string]any{
-		"query":      prompt,
-		"project_id": project,
-		"mode":       "hybrid",
-		"limit":      recallSearchLim,
+		"query": prompt,
+		"mode":  "hybrid",
+		"limit": recallSearchLim,
 	})
 	client := &http.Client{Timeout: recallTimeout}
 	resp, err := client.Post("http://"+addr+"/api/v1/memories/search",
@@ -156,36 +132,36 @@ func recallSearch(addr, project, prompt string) ([]recallHit, error) {
 	return out.Results, nil
 }
 
-// renderRecall formats up to maxHits hits whose keypath is not in seen.
+// renderRecall formats up to maxHits hits whose seen key is not in seen.
 // Hits ranked below maxHits fill the slots that seen hits free up, but only
 // when the semantic side returned them: an FTS-only hit that deep is a
-// common-word match, not a topic match. It returns the block and the
-// keypaths it printed. An empty block means nothing new to show.
-func renderRecall(project string, hits []recallHit, seen map[string]bool, maxHits, maxChars int) (string, []string) {
+// common-word match, not a topic match. It returns the block and the seen
+// keys it printed. An empty block means nothing new to show.
+func renderRecall(hits []recallHit, seen map[string]bool, maxHits, maxChars int) (string, []string) {
 	var b strings.Builder
 	var shown []string
 	for i, h := range hits {
 		if len(shown) == maxHits {
 			break
 		}
-		if seen[h.Keypath] {
+		if seen[h.seenKey()] {
 			continue
 		}
 		if i >= maxHits && !slices.Contains(h.Sources, "semantic") {
 			continue
 		}
 		if len(shown) == 0 {
-			fmt.Fprintf(&b, "<memstate-recall project=%q>\n", project)
-			b.WriteString("Memories related to this prompt. Call memstate_get(keypath) for full content.\n\n")
+			b.WriteString("<memstate-recall>\n")
+			b.WriteString("Memories related to this prompt. Call memstate_get(project_id, keypath) for full content.\n\n")
 		}
-		fmt.Fprintf(&b, "### %s", h.Keypath)
+		fmt.Fprintf(&b, "### %s", h.seenKey())
 		if h.Category != "" {
 			fmt.Fprintf(&b, " [%s]", h.Category)
 		}
 		b.WriteString("\n")
 		b.WriteString(cutRunes(strings.TrimSpace(h.Content), maxChars))
 		b.WriteString("\n\n")
-		shown = append(shown, h.Keypath)
+		shown = append(shown, h.seenKey())
 	}
 	if len(shown) == 0 {
 		return "", nil

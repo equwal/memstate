@@ -8,8 +8,9 @@
  * calls each MCP tool, and checks the response contracts: write actions
  * (created / superseded / unchanged), heading extraction, tree and keypath
  * reads, FTS search and filters, history with tombstones, recursive delete,
- * project soft-delete and revival, error paths, and the `memstated recall`
- * hook against a second daemon in shared mode (found through daemon.addr).
+ * project soft-delete and revival, error paths, the session project that a
+ * write names with project_name, and the `memstated recall` hook against a
+ * second daemon in shared mode (found through daemon.addr).
  *
  * The test is hermetic: MEMSTATE_OLLAMA_URL points at a closed port, so
  * embedding is unreachable. Writes must still succeed (fire-and-forget) and
@@ -67,14 +68,23 @@ async function main() {
   env.MEMSTATE_NO_UPDATE_CHECK = "1";
   env.MEMSTATE_OLLAMA_URL = "http://127.0.0.1:9"; // closed port: no network
 
-  const transport = new StdioClientTransport({
-    command: process.execPath,
-    args: [PROXY],
-    env,
-    stderr: "ignore",
-  });
-  const client = new Client({ name: "regression-test", version: "0.0.0" });
-  await client.connect(transport);
+  // The proxy runs in a folder whose name slugs to PROJECT, so a proxy that
+  // took its project from the folder would fail the session checks below.
+  const cwd = path.join(tmp, "regress-test");
+  fs.mkdirSync(cwd);
+  const connect = async () => {
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: [PROXY],
+      env,
+      cwd,
+      stderr: "ignore",
+    });
+    const c = new Client({ name: "regression-test", version: "0.0.0" });
+    await c.connect(transport);
+    return c;
+  };
+  const client = await connect();
 
   try {
     // ---- tool surface ---------------------------------------------------
@@ -393,13 +403,83 @@ async function main() {
       bad.isError === true,
       JSON.stringify(bad));
 
+    // ---- session project ------------------------------------------------------
+    // No call so far passed project_name, so the session has no project.
+    r = await call(client, "memstate_get", {});
+    check("session: a read without project_id fails before the session names a project",
+      r.isError && r.message.includes("no project yet"),
+      JSON.stringify(r));
+
+    r = await call(client, "memstate_set", { keypath: "notes.session", value: "a" });
+    check("session: a write without project_id or project_name fails",
+      r.isError && r.message.includes("project_name"),
+      JSON.stringify(r));
+
+    r = await call(client, "memstate_set", {
+      keypath: "notes.session", value: "a", project_name: "Bad-Name",
+    });
+    check("session: an invalid project_name is refused",
+      r.isError && r.message.includes("snake_case"),
+      JSON.stringify(r));
+
+    r = await call(client, "memstate_set", {
+      keypath: "notes.session", value: "a", project_name: PROJECT,
+    });
+    check("session: project_name can name an existing project",
+      !r.isError && r.data.stored.project_id === PROJECT,
+      JSON.stringify(r));
+
+    r = await call(client, "memstate_get", { keypath: "notes.session" });
+    check("session: later reads without project_id use the session's project",
+      !r.isError && r.data.memories[0]?.content === "a",
+      JSON.stringify(r));
+
+    r = await call(client, "memstate_remember", {
+      keypath: "notes.remembered", content: "b",
+    });
+    check("session: later writes without project_id use the session's project",
+      !r.isError && r.data.items[0]?.stored.project_id === PROJECT,
+      JSON.stringify(r));
+
+    r = await call(client, "memstate_set", {
+      keypath: "notes.session", value: "c", project_name: "another_name",
+    });
+    check("session: a second, different project_name is refused",
+      r.isError && r.message.includes(`already "${PROJECT}"`),
+      JSON.stringify(r));
+
+    r = await call(client, "memstate_get", { list_projects: true });
+    check("session: naming an existing project creates no new project",
+      !r.isError &&
+        r.data.projects.filter((p) => p.id.startsWith(PROJECT)).length === 1 &&
+        !r.data.projects.some((p) => p.id === "another_name"),
+      JSON.stringify(r));
+
+    // A new proxy starts without a project, and remember can name a new one.
+    const second = await connect();
+    try {
+      r = await call(second, "memstate_search", { query: "session" });
+      check("session: a new proxy has no project",
+        r.isError && r.message.includes("no project yet"),
+        JSON.stringify(r));
+      r = await call(second, "memstate_remember", {
+        content: "## Notes\nfresh subject\n", project_name: "fresh_subject",
+      });
+      const fresh = await call(second, "memstate_get", {});
+      check("session: remember with project_name names a new project",
+        !r.isError &&
+          r.data.items[0]?.stored.project_id === "fresh_subject" &&
+          !fresh.isError && fresh.data.project_id === "fresh_subject",
+        JSON.stringify({ r, fresh }));
+    } finally {
+      await second.close();
+    }
+
     // ---- recall hook ----------------------------------------------------------
     // A shared-mode daemon on the same DB publishes daemon.addr next to it;
     // `memstated recall` has no MEMSTATE_ADDR here, so it must discover the
-    // daemon through that file. The cwd basename slugs to PROJECT.
+    // daemon through that file. It searches all projects.
     await withSharedDaemon(env, async () => {
-      const cwd = path.join(tmp, "regress-test");
-      fs.mkdirSync(cwd);
       const recall = (session) =>
         execFileSync(DAEMON, ["recall"], {
           env,
@@ -411,14 +491,14 @@ async function main() {
         }).toString();
       const first = recall("regress_s1");
       check("recall: finds the shared daemon via daemon.addr and injects a hit",
-        first.includes(`<memstate-recall project="${PROJECT}">`) &&
-          first.includes("### decisions"),
+        first.includes("<memstate-recall>") &&
+          first.includes(`### ${PROJECT}:decisions`),
         JSON.stringify(first));
       check("recall: same session does not repeat a keypath",
         recall("regress_s1") === "",
         JSON.stringify(first));
       check("recall: a new session sees the keypath again",
-        recall("regress_s2").includes("### decisions"),
+        recall("regress_s2").includes(`### ${PROJECT}:decisions`),
         "");
     });
   } finally {
