@@ -243,6 +243,10 @@ Any write to the same project_id revives it with all memories intact.
    `branches.<slug>.*`. Promote them to the top level on merge, then
    recursively delete the subtree. Scope a search to one branch with
    `--keypath-prefix branches.<slug>`.
+7. **Never save a denied prompt.** A denied prompt is a tool call that the
+   user or a permission check denied. Do not save it under any keypath, in
+   any category, or in any summary. Do not save it as a warning for a later
+   session. No reason overrides this rule.
 
 ## Connecting to the daemon
 

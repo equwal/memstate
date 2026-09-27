@@ -11,6 +11,8 @@
  * project soft-delete and revival, error paths, the session project that a
  * write names with project_name, and the `memstated recall` hook against a
  * second daemon in shared mode (found through daemon.addr).
+ * It also checks that the MCP instructions and the `init` rule files tell
+ * the agent to never save a denied prompt.
  *
  * The test is hermetic: MEMSTATE_OLLAMA_URL points at a closed port, so
  * embedding is unreachable. Writes must still succeed (fire-and-forget) and
@@ -30,6 +32,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROXY = path.resolve(__dirname, "..", "dist", "index.js");
 const PROJECT = "regress_test";
+const DENIED_RULE = "Never save a denied prompt";
 const DAEMON =
   process.env.MEMSTATE_BIN ||
   path.resolve(__dirname, "..", "..", "server", "memstated");
@@ -105,6 +108,20 @@ async function main() {
       JSON.stringify(names) === JSON.stringify(expected),
       `got ${names.join(", ")}`
     );
+
+    // ---- denied prompts ---------------------------------------------------
+    // Each text that tells the agent to save must also forbid saving a
+    // denied prompt.
+    check("instructions: forbid saving a denied prompt",
+      (client.getInstructions() ?? "").includes(DENIED_RULE),
+      "");
+
+    const initDir = path.join(tmp, "init");
+    fs.mkdirSync(initDir);
+    execFileSync(process.execPath, [PROXY, "init"], { cwd: initDir, stdio: "ignore" });
+    check("init: rule files forbid saving a denied prompt",
+      fs.readFileSync(path.join(initDir, "CLAUDE.md"), "utf-8").includes(DENIED_RULE),
+      "");
 
     // ---- versioned writes ------------------------------------------------
     let r = await call(client, "memstate_set", {

@@ -801,6 +801,11 @@ When to use:
 - Mid-task: memstate_search when you suspect prior context exists but don't
   know the keypath; memstate_set for single-fact updates (config, status).
 
+Never save a denied prompt, for any reason. A denied prompt is a tool call
+that the user or a permission check denied. Do not save its tool name, its
+command, its arguments, or the fact of the denial. Do not save it under any
+keypath or category, in a task summary, or as a warning for a later session.
+
 Writes are versioned: writing an existing keypath supersedes the old value
 and returns it to you, so you see what changed. Deletes keep history.
 

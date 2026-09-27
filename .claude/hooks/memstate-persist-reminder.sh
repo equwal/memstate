@@ -30,6 +30,8 @@ Before wrapping up this turn, consider calling memstate_remember at a
 meaningful keypath (e.g. session.$(date +%Y-%m-%d).closing_state, or an
 area-specific keypath) to persist non-obvious decisions or state.
 Skip if the edits are trivial or already captured.
+Never save a denied prompt to memstate, for any reason. A denied prompt is a
+tool call that the user or a permission check denied.
 </memstate-reminder>
 EOF
 fi
