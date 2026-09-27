@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
-"""Tombstone a keypath (memstated)."""
+"""Tombstone a keypath (memstated). --scope user targets the user scope."""
 import argparse
 import sys
 
-from _client import require_project, post
+from _client import add_scope_args, post, resolve_project
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Soft-delete a keypath")
-    ap.add_argument("--project", default=None,
-                    help="project id (required: the scripts do not derive one)")
+    add_scope_args(ap)
     ap.add_argument("--keypath", required=True)
     ap.add_argument("--recursive", action="store_true")
     args = ap.parse_args()
 
     return post("/memories/delete", {
-        "project_id": require_project(args.project),
+        "project_id": resolve_project(args),
         "keypath": args.keypath,
         "recursive": args.recursive,
     })

@@ -214,7 +214,7 @@ func handleStore(store *Store, embedder *Embedder) http.HandlerFunc {
 		meta := WriteMeta{Source: in.Source, Category: in.Category, Topics: in.Topics}
 		stored, prev, err := store.Write(in.ProjectID, kp, in.Content, meta, false)
 		if err != nil {
-			writeErr(w, http.StatusInternalServerError, err.Error())
+			writeErr(w, writeStatus(err), err.Error())
 			return
 		}
 		action := classifyWrite(stored, prev)
@@ -287,7 +287,7 @@ func handleRemember(store *Store, embedder *Embedder) http.HandlerFunc {
 		meta := WriteMeta{Source: in.Source, Category: in.Category, Topics: in.Topics}
 		batch, err := store.WriteBatch(in.ProjectID, sections, meta)
 		if err != nil {
-			writeErr(w, http.StatusInternalServerError, err.Error())
+			writeErr(w, writeStatus(err), err.Error())
 			return
 		}
 		out := rememberResp{Method: method, Items: make([]extractedItem, len(batch))}
@@ -304,6 +304,15 @@ func handleRemember(store *Store, embedder *Embedder) http.HandlerFunc {
 		}
 		writeJSON(w, http.StatusOK, out)
 	}
+}
+
+// writeStatus maps a store write error to an HTTP status. A refused
+// reserved-project write is the caller's mistake, not a server fault.
+func writeStatus(err error) int {
+	if errors.Is(err, ErrReservedWrite) {
+		return http.StatusBadRequest
+	}
+	return http.StatusInternalServerError
 }
 
 // classifyWrite names the outcome of a single write:

@@ -175,8 +175,9 @@ proxy starts without one. Keypaths use dot notation.
 
 A useful agent loop:
 
-- At task start, call `memstate_get(list_projects=true)`, then `memstate_get(project_id=...)` to load the tree of the project that the work belongs to. Call `memstate_search(query=...)` when you do not know the exact keypath.
+- At task start, call `memstate_get(list_projects=true)`, then `memstate_get(project_id=...)` to load the tree of the project that the work belongs to. The response also carries the user scope under `user`. Call `memstate_search(query=...)` when you do not know the exact keypath.
 - At task end, call `memstate_remember(content="## Summary\n...\n## Decisions\n...", project_name=...)` and let the server extract the sections. The first write of a session names its project; later calls can omit it.
+- Facts about the user or this machine, not about the code, go to `scope="user"`: `preferences.*`, `profile.*`, `host.<host_slug>.env.*`, `host.<host_slug>.tools.*`. The daemon rejects any other keypath there, so decisions and task summaries cannot leak into a shared store.
 - Never save a denied prompt. A denied prompt is a tool call that the user or a permission check denied.
 
 `node client/dist/index.js init` writes rule files for several agents
@@ -378,6 +379,33 @@ python3 client/skill/scripts/memstate_search.py \
 ```
 
 See `client/skill/SKILL.md` for the skill usage contract.
+
+## Browse and edit from the shell (`memstate`)
+
+`make install` links `memstate` to the daemon binary. It reads the SQLite
+file directly and sends writes through the shared daemon, so versioning,
+embeddings and the user-scope rules apply exactly as they do for an agent.
+Each verb needs `--project ID` or `--user`: the CLI does not derive a
+project from the folder you are in.
+
+```bash
+memstate projects                      # every live project
+memstate tree --project my_app         # keypath tree, plus your user scope
+memstate get decisions --project my_app                 # content under one keypath
+memstate get todo --raw --project my_app | less         # content only
+memstate history config.port --project my_app           # every version, newest first
+memstate search "why sqlite" --limit 5 --project my_app # hybrid search via the daemon
+memstate set config.port 8080 --category config --project my_app
+memstate edit notes.setup --project my_app              # $EDITOR on the current content
+memstate rm branches.old --recursive --project my_app   # asks y/N; --yes to skip
+memstate tree --user                   # preferences, profile, this host's env and tools
+memstate tree --project my_app --json | jq .user        # raw shapes for scripts
+```
+
+`--project ID` names the project, `--user` the reserved user scope,
+`--all` (search) the whole store. Flags may follow positionals. Without a
+shared daemon, reads still work and `search` degrades to FTS; `set`, `edit`
+and `rm` tell you how to start one.
 
 ## How the pieces fit
 

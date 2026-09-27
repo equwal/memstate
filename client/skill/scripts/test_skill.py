@@ -168,6 +168,40 @@ def main():
         expect_key="project_id", expect_value=PROJECT_ID
     )
 
+    # 13. user scope — the daemon allows only the allowlisted shapes there.
+    user_kp = f"preferences.skill_test_{int(time.time())}"
+    test(
+        "memstate_set: --scope user accepts a preferences fact",
+        "memstate_set.py",
+        ["--scope", "user", "--keypath", user_kp, "--value", "terse answers"],
+        expect_key="action", expect_value="created"
+    )
+    code, stdout, stderr = run_script(
+        "memstate_set.py", "--scope", "user", "--keypath", "todo.skill_test", "--value", "nope")
+    rejected = code == 1 and "HTTP 400" in stderr and "allowed" in stderr
+    print(f"{PASS if rejected else FAIL} memstate_set: --scope user rejects a todo keypath")
+    if not rejected:
+        print(f"       code={code} stderr={stderr.strip()[:300]}")
+    results.append(("memstate_set: --scope user rejects a todo keypath", rejected))
+    test(
+        "memstate_get: --scope user tree carries user.host",
+        "memstate_get.py",
+        ["--scope", "user"],
+        expect_key="host"
+    )
+    test(
+        "memstate_get: project tree carries the user scope",
+        "memstate_get.py",
+        ["--project", "skill_test_other"],
+        expect_key="user"
+    )
+    test(
+        "memstate_delete: --scope user cleans up",
+        "memstate_delete.py",
+        ["--scope", "user", "--keypath", user_kp],
+        expect_key="deleted_count"
+    )
+
     # Summary
     passed = sum(1 for _, r in results if r is True)
     failed = sum(1 for _, r in results if r is False)

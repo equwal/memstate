@@ -84,6 +84,8 @@ func runRecall(stdin io.Reader, stdout io.Writer) int {
 		debug("search: %v", err)
 		return 0
 	}
+	// A user-scope hit about another machine is noise here.
+	hits = filterHostHits(hits, hostSlug())
 	seenPath := recallSeenPath(ev.SessionID)
 	seen := loadSeen(seenPath)
 	text, shown := renderRecall(hits, seen, recallMaxHits, recallMaxChars)
@@ -132,29 +134,64 @@ func recallSearch(addr, prompt string) ([]recallHit, error) {
 	return out.Results, nil
 }
 
-// renderRecall formats up to maxHits hits whose seen key is not in seen.
-// Hits ranked below maxHits fill the slots that seen hits free up, but only
-// when the semantic side returned them: an FTS-only hit that deep is a
-// common-word match, not a topic match. It returns the block and the seen
-// keys it printed. An empty block means nothing new to show.
-func renderRecall(hits []recallHit, seen map[string]bool, maxHits, maxChars int) (string, []string) {
-	var b strings.Builder
-	var shown []string
+// filterHostHits drops user-scope hits that describe another machine:
+// anything under host.<slug> in the user project where slug is not this
+// host. Hits of other projects stay.
+func filterHostHits(hits []recallHit, host string) []recallHit {
+	out := hits[:0:0]
+	for _, h := range hits {
+		if h.ProjectID != userProject || !isOtherHost(h.Keypath, host) {
+			out = append(out, h)
+		}
+	}
+	return out
+}
+
+// pickRecall selects up to max hits whose seen key is not in seen. Hits
+// ranked below max fill the slots that seen hits free up, but only when the
+// semantic side returned them: an FTS-only hit that deep is a common-word
+// match, not a topic match.
+func pickRecall(hits []recallHit, seen map[string]bool, max int) []recallHit {
+	var out []recallHit
 	for i, h := range hits {
-		if len(shown) == maxHits {
+		if len(out) == max {
 			break
 		}
 		if seen[h.seenKey()] {
 			continue
 		}
-		if i >= maxHits && !slices.Contains(h.Sources, "semantic") {
+		if i >= max && !slices.Contains(h.Sources, "semantic") {
 			continue
 		}
-		if len(shown) == 0 {
-			b.WriteString("<memstate-recall>\n")
-			b.WriteString("Memories related to this prompt. Call memstate_get(project_id, keypath) for full content.\n\n")
+		out = append(out, h)
+	}
+	return out
+}
+
+// renderRecall formats up to maxHits unseen hits. One slot is reserved for
+// the best user-scope hit, marked [user]; hits of the other projects fill the
+// rest. It returns the block and the seen keys it printed. An empty block
+// means nothing new to show.
+func renderRecall(hits []recallHit, seen map[string]bool, maxHits, maxChars int) (string, []string) {
+	var projHits, userHits []recallHit
+	for _, h := range hits {
+		if h.ProjectID == userProject {
+			userHits = append(userHits, h)
+		} else {
+			projHits = append(projHits, h)
 		}
-		fmt.Fprintf(&b, "### %s", h.seenKey())
+	}
+	user := pickRecall(userHits, seen, 1)
+	proj := pickRecall(projHits, seen, maxHits-len(user))
+	if len(user)+len(proj) == 0 {
+		return "", nil
+	}
+	var b strings.Builder
+	var shown []string
+	b.WriteString("<memstate-recall>\n")
+	b.WriteString("Memories related to this prompt. Call memstate_get(project_id, keypath) for full content.\n\n")
+	write := func(h recallHit, marker string) {
+		fmt.Fprintf(&b, "### %s%s", h.seenKey(), marker)
 		if h.Category != "" {
 			fmt.Fprintf(&b, " [%s]", h.Category)
 		}
@@ -163,8 +200,11 @@ func renderRecall(hits []recallHit, seen map[string]bool, maxHits, maxChars int)
 		b.WriteString("\n\n")
 		shown = append(shown, h.seenKey())
 	}
-	if len(shown) == 0 {
-		return "", nil
+	for _, h := range proj {
+		write(h, "")
+	}
+	for _, h := range user {
+		write(h, " [user]")
 	}
 	b.WriteString("</memstate-recall>\n")
 	return b.String(), shown

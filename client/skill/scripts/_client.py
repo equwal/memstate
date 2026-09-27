@@ -21,6 +21,7 @@ import json
 import os
 import re
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -168,18 +169,31 @@ def _base() -> str:
 _HEADERS = {"Content-Type": "application/json"}
 
 
-def _request(method: str, path: str, body: Optional[dict] = None) -> int:
+def fetch(method: str, path: str, body: Optional[dict] = None):
+    """One daemon call. Returns the parsed JSON body (or the raw text when
+    it is not JSON). Raises urllib errors; use emit() to turn them into an
+    exit code."""
     url = f"{_base()}{path}"
     data = None if body is None else json.dumps(body).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=_HEADERS, method=method)
+    with urllib.request.urlopen(req) as resp:
+        payload = resp.read().decode("utf-8")
+        try:
+            return json.loads(payload)
+        except json.JSONDecodeError:
+            return payload
+
+
+def emit(call) -> int:
+    """Run call(), print its result as JSON, and map daemon errors to exit
+    codes: 1 for an HTTP error, 2 for an unreachable daemon."""
     try:
-        with urllib.request.urlopen(req) as resp:
-            payload = resp.read().decode("utf-8")
-            try:
-                print(json.dumps(json.loads(payload), indent=2))
-            except json.JSONDecodeError:
-                print(payload)
-            return 0
+        result = call()
+        if isinstance(result, str):
+            print(result)
+        else:
+            print(json.dumps(result, indent=2))
+        return 0
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", errors="replace")
         print(f"Error: HTTP {e.code} {detail}", file=sys.stderr)
@@ -202,9 +216,74 @@ def require_project(project: Optional[str]) -> str:
     return project
 
 
+def slug_name(name: str) -> str:
+    """Shared id rule: lowercase, runs of other characters become "_",
+    edge underscores trimmed. Same rule as the TS proxy and the Go daemon."""
+    slug = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+    return slug or "default"
+
+
+# USER_PROJECT is the daemon's one reserved project for facts about the
+# user and the host. The daemon rejects writes there outside a short
+# allowlist of keypath shapes (see SKILL.md, "User scope").
+USER_PROJECT = "_user"
+
+
+def host_slug() -> str:
+    """This machine's segment under host.<slug> in USER_PROJECT: the first
+    hostname label, slugged. Same rule as the TS proxy and the Go daemon."""
+    return slug_name(socket.gethostname().split(".")[0])
+
+
+def add_scope_args(ap) -> None:
+    """Add the --project / --scope pair every script accepts."""
+    ap.add_argument("--project", default=None,
+                    help="project id (required unless --scope user: the "
+                         "scripts do not derive one)")
+    ap.add_argument("--scope", choices=("project", "user"), default="project",
+                    help="'user' targets the reserved user scope (facts about "
+                         "the user or this machine, not about one project)")
+
+
+def resolve_project(args) -> str:
+    """Project id for a call: the reserved user project for --scope user,
+    else --project, which is then required."""
+    if args.scope == "user":
+        if args.project:
+            raise SystemExit("Error: pass --scope user or --project, not both")
+        return USER_PROJECT
+    return require_project(args.project)
+
+
+def is_other_host(keypath: str) -> bool:
+    """True when a user-scope keypath describes another machine."""
+    seg = keypath.split(".")
+    return seg[0] == "host" and len(seg) >= 2 and seg[1] != host_slug()
+
+
+def prune_other_hosts(domains: list) -> list:
+    """Keep only this machine's subtree under `host`."""
+    out = []
+    for d in domains:
+        if d.get("name") == "host":
+            d = dict(d)
+            d["children"] = [c for c in d.get("children", []) if c.get("name") == host_slug()]
+        out.append(d)
+    return out
+
+
+def count_values(nodes: list) -> int:
+    n = 0
+    for node in nodes:
+        if node.get("has_value"):
+            n += 1
+        n += count_values(node.get("children", []))
+    return n
+
+
 def post(path: str, body: dict) -> int:
-    return _request("POST", path, body)
+    return emit(lambda: fetch("POST", path, body))
 
 
 def get(path: str) -> int:
-    return _request("GET", path, None)
+    return emit(lambda: fetch("GET", path, None))

@@ -172,3 +172,98 @@ func jsonString(s string) string {
 	b, _ := json.Marshal(s)
 	return string(b)
 }
+
+func TestRenderRecallUserScope(t *testing.T) {
+	both := []string{"fts", "semantic"}
+	// The user hits rank first, so a fixed slot, not rank, gives them room.
+	hits := []recallHit{
+		{ProjectID: userProject, Keypath: "preferences.commit_style", Content: "no trailers", Category: "config", Sources: both},
+		{ProjectID: userProject, Keypath: "profile.role", Content: "backend", Sources: both},
+		{ProjectID: "p", Keypath: "p1", Content: "project one", Sources: both},
+		{ProjectID: "q", Keypath: "p2", Content: "project two", Sources: both},
+		{ProjectID: "p", Keypath: "p3", Content: "project three", Sources: both},
+	}
+	text, shown := renderRecall(hits, map[string]bool{}, 3, 500)
+	// One slot goes to the user scope, the rest to the other projects.
+	if want := "p:p1,q:p2,_user:preferences.commit_style"; strings.Join(shown, ",") != want {
+		t.Fatalf("shown = %v want %s", shown, want)
+	}
+	if !strings.Contains(text, "### _user:preferences.commit_style [user] [config]\nno trailers\n") {
+		t.Fatalf("user hit marker missing:\n%s", text)
+	}
+	if strings.Contains(text, "profile.role") || strings.Contains(text, "project three") {
+		t.Fatalf("second user hit or fourth hit leaked:\n%s", text)
+	}
+	// A seen user hit frees its slot for the next user hit.
+	seen := map[string]bool{"_user:preferences.commit_style": true}
+	if _, shown := renderRecall(hits, seen, 3, 500); strings.Join(shown, ",") != "p:p1,q:p2,_user:profile.role" {
+		t.Fatalf("shown = %v", shown)
+	}
+	// A project keypath equal to a user keypath is not suppressed by it.
+	seen = map[string]bool{"p:preferences.commit_style": true}
+	if _, shown := renderRecall(hits, seen, 3, 500); strings.Join(shown, ",") != "p:p1,q:p2,_user:preferences.commit_style" {
+		t.Fatalf("seen keys must be scoped: shown = %v", shown)
+	}
+	// User hits alone still render.
+	if text, _ := renderRecall(hits[:2], map[string]bool{}, 3, 500); !strings.Contains(text, "### _user:preferences.commit_style [user]") {
+		t.Fatalf("user-only render:\n%s", text)
+	}
+}
+
+func TestFilterHostHits(t *testing.T) {
+	hits := []recallHit{
+		{ProjectID: userProject, Keypath: "preferences.x"},
+		{ProjectID: userProject, Keypath: "host.mbp.env.go_bin"},
+		{ProjectID: userProject, Keypath: "host.other.env.go_bin"},
+		{ProjectID: userProject, Keypath: "host"},
+		// A keypath of another project that looks like a host path stays.
+		{ProjectID: "p", Keypath: "host.other.env.go_bin"},
+	}
+	got := filterHostHits(hits, "mbp")
+	if len(got) != 4 || got[0].Keypath != "preferences.x" || got[1].Keypath != "host.mbp.env.go_bin" ||
+		got[2].Keypath != "host" || got[3].ProjectID != "p" {
+		t.Fatalf("got %+v", got)
+	}
+}
+
+func TestRunRecallUserScope(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("MEMSTATE_DB", filepath.Join(dir, "t.db"))
+	t.Setenv("MEMSTATE_NO_RECALL", "")
+	ts := newTestServer(t)
+	t.Setenv("MEMSTATE_ADDR", strings.TrimPrefix(ts.URL, "http://"))
+
+	cwd := filepath.Join(t.TempDir(), "scope-proj")
+	if err := os.Mkdir(cwd, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	seed := func(kp, content string) {
+		t.Helper()
+		code, out := postJSON(t, ts.URL+"/api/v1/memories/store", map[string]any{
+			"project_id": userProject, "keypath": kp, "content": content,
+		})
+		if code != 200 {
+			t.Fatalf("seed %s: %d %v", kp, code, out)
+		}
+	}
+	seed("preferences.commit_style", "the user wants short commit subjects and no trailers")
+	seed("host."+hostSlug()+".env.go_bin", "commit binaries of go live in GOBIN under the home dir")
+	seed("host.other_box.env.go_bin", "commit binaries of go live in /opt on the other box")
+
+	var out bytes.Buffer
+	event := `{"session_id":"u1","cwd":` + jsonString(cwd) +
+		`,"prompt":"what commit style does the user want for go binaries"}`
+	if code := runRecall(strings.NewReader(event), &out); code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+	text := out.String()
+	if !strings.Contains(text, "[user]") {
+		t.Fatalf("user hit missing:\n%s", text)
+	}
+	if strings.Contains(text, "other_box") {
+		t.Fatalf("other host leaked:\n%s", text)
+	}
+	if strings.Count(text, "[user]") != 1 {
+		t.Fatalf("more than one user slot:\n%s", text)
+	}
+}

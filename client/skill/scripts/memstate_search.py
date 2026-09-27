@@ -13,18 +13,20 @@ Three modes:
                  running locally with the configured embed model
                  (default nomic-embed-text; set MEMSTATE_EMBED_MODEL
                  or start memstated with --embed-model to change it).
+
+--scope user searches the reserved user scope and drops hits that describe
+another machine (host.<other_slug>.*).
 """
 import argparse
 import sys
 
-from _client import require_project, post
+from _client import add_scope_args, emit, fetch, is_other_host, resolve_project
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Search memories")
     ap.add_argument("--query", required=True)
-    ap.add_argument("--project", default=None,
-                    help="project id (required: the scripts do not derive one)")
+    add_scope_args(ap)
     ap.add_argument("--all-projects", action="store_true",
                     help="search every project instead of one")
     ap.add_argument("--limit", type=int, default=20)
@@ -41,7 +43,7 @@ def main() -> int:
 
     body = {"query": args.query, "limit": args.limit, "mode": args.mode}
     if not args.all_projects:
-        body["project_id"] = require_project(args.project)
+        body["project_id"] = resolve_project(args)
     if args.threshold is not None:
         body["threshold"] = args.threshold
     if args.category:
@@ -50,7 +52,15 @@ def main() -> int:
         body["topics"] = args.topics.split(",")
     if args.keypath_prefix:
         body["keypath_prefix"] = args.keypath_prefix
-    return post("/memories/search", body)
+
+    def search():
+        out = fetch("POST", "/memories/search", body)
+        if args.scope == "user" and isinstance(out, dict) and isinstance(out.get("results"), list):
+            out["results"] = [h for h in out["results"] if not is_other_host(h.get("keypath", ""))]
+            out["total_found"] = len(out["results"])
+        return out
+
+    return emit(search)
 
 
 if __name__ == "__main__":

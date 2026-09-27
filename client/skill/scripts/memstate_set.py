@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
-"""Store a single fact at a keypath (memstated)."""
+"""Store a single fact at a keypath (memstated).
+
+--scope user writes to the reserved user scope. The daemon accepts only
+preferences.*, profile.*, host.<host_slug>.env.* and host.<host_slug>.tools.*
+there; see SKILL.md, "User scope".
+"""
 import argparse
 import sys
 
-from _client import require_project, post
+from _client import add_scope_args, post, resolve_project
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Set a single fact at a keypath")
-    ap.add_argument("--project", default=None,
-                    help="project id (required: the scripts do not derive one)")
+    add_scope_args(ap)
     ap.add_argument("--keypath", required=True)
     ap.add_argument("--value", required=True)
     ap.add_argument("--source", default=None)
@@ -20,7 +24,7 @@ def main() -> int:
     args = ap.parse_args()
 
     body = {
-        "project_id": require_project(args.project),
+        "project_id": resolve_project(args),
         "keypath": args.keypath,
         "content": args.value,
     }

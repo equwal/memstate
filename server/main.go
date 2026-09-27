@@ -43,7 +43,7 @@ import (
 const (
 	defaultAddr       = "127.0.0.1:8765" // used only in --addr / stop / status
 	healthServiceName = "memstate"
-	healthVersion     = "0.7.2"
+	healthVersion     = "0.7.4"
 	readyBanner       = "MEMSTATE_READY addr="
 )
 
@@ -123,10 +123,18 @@ func expandHome(p string) string {
 }
 
 func main() {
+	// Invoked through the `memstate` link (make install creates it): the
+	// human CLI only, never the daemon.
+	if prog := strings.TrimSuffix(filepath.Base(os.Args[0]), ".exe"); prog == "memstate" {
+		os.Exit(cmdCLI(os.Args[1:]))
+	}
+
 	// Dispatch subcommands before flag parsing; the subcommands have their
 	// own simple arg handling and don't spin up the server.
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
+		case "tree", "get", "show", "cat", "history", "log", "set", "edit", "rm", "delete":
+			os.Exit(cmdCLI(os.Args[1:]))
 		case "stop":
 			os.Exit(cmdStop(os.Args[2:]))
 		case "status":
@@ -382,11 +390,12 @@ func printUsage() {
 
   memstated projects [--db PATH]   list live projects with memory counts
   memstated dump [--keys] [--db PATH] PROJECT [KEYPATH]
-                                   pretty-print a project's memories (or the
-                                   subtree under KEYPATH); --keys for the
-                                   keypath tree only
-  memstated search [--project ID] [--limit N] [--db PATH] QUERY...
-                                   full-text search across memories
+                                   alias of "memstate get --project PROJECT"
+                                   (--keys: "memstate tree")
+  memstated search QUERY...        alias of "memstate search"
+  memstate <verb>                  browse and edit the store: tree, get,
+                                   history, search, set, edit, rm, projects,
+                                   status. See "memstate --help".
   memstated upgrade [--addr HOST:PORT]
                                    download the latest release binary over this
                                    one and restart the shared daemon if running

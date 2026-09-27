@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"regexp"
 	"slices"
@@ -10,9 +11,8 @@ import (
 	"time"
 )
 
-// dump/search are CLI-only, like export/import: human inspection workflows
-// over the local SQLite file. No HTTP route, no MCP tool — the model already
-// has memstate_get/memstate_search for programmatic access.
+// ANSI rendering shared by the memstate CLI verbs (cli.go). dump/search
+// survive here only as aliases of those verbs.
 
 // ---------- ANSI rendering ----------
 
@@ -116,20 +116,20 @@ func entryMeta(m *Memory) string {
 	return strings.Join(parts, " · ")
 }
 
-func printEntry(m *Memory, showProject bool, p palette) {
+func printEntry(w io.Writer, m *Memory, showProject bool, p palette) {
 	kp := m.Keypath
 	if showProject {
 		kp = m.ProjectID + ":" + kp
 	}
-	fmt.Printf("%s  %s\n", p.bold(p.cyan(kp)), p.dim(entryMeta(m)))
-	fmt.Print(renderMarkdown(m.Content, "  ", p))
-	fmt.Println()
+	fmt.Fprintf(w, "%s  %s\n", p.bold(p.cyan(kp)), p.dim(entryMeta(m)))
+	fmt.Fprint(w, renderMarkdown(m.Content, "  ", p))
+	fmt.Fprintln(w)
 }
 
 // printKeyTree renders sorted keypaths as an indented tree. A segment that
 // only exists as a prefix of deeper keys prints as a branch; a segment with
 // its own row prints as a leaf with metadata.
-func printKeyTree(mems []*Memory, p palette) {
+func printKeyTree(w io.Writer, mems []*Memory, p palette) {
 	var prev []string
 	for _, m := range mems {
 		parts := strings.Split(m.Keypath, ".")
@@ -138,9 +138,9 @@ func printKeyTree(mems []*Memory, p palette) {
 			common++
 		}
 		for i := common; i < len(parts)-1; i++ {
-			fmt.Printf("%s%s\n", strings.Repeat("  ", i), p.bold(p.blue(parts[i])))
+			fmt.Fprintf(w, "%s%s\n", strings.Repeat("  ", i), p.bold(p.blue(parts[i])))
 		}
-		fmt.Printf("%s%s  %s\n",
+		fmt.Fprintf(w, "%s%s  %s\n",
 			strings.Repeat("  ", len(parts)-1),
 			p.cyan(parts[len(parts)-1]),
 			p.dim(entryMeta(m)))
@@ -179,109 +179,41 @@ func flagAfterPositional(raw, positionals []string) bool {
 	return false
 }
 
-// ---------- subcommands ----------
+// ---------- legacy subcommands ----------
 
+// cmdDump keeps `memstated dump [--keys] PROJECT [KEYPATH]` working as an
+// alias of `memstate get --project PROJECT [KEYPATH]` (or `memstate tree`
+// with --keys).
 func cmdDump(args []string) int {
-	fs := flag.NewFlagSet("dump", flag.ExitOnError)
-	db := fs.String("db", "", "SQLite file (default MEMSTATE_DB or ~/.memstate/memstate.db)")
-	keys := fs.Bool("keys", false, "list keypaths only, as a tree (no content)")
-	noColor := fs.Bool("no-color", false, "disable ANSI colors")
-	_ = fs.Parse(args)
-	if fs.NArg() < 1 || fs.NArg() > 2 || flagAfterPositional(args, fs.Args()) {
-		fmt.Fprintln(os.Stderr, "usage: memstated dump [--keys] [--db PATH] PROJECT [KEYPATH] (flags before args)")
+	fs := flag.NewFlagSet("dump", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	db := fs.String("db", "", "")
+	keys := fs.Bool("keys", false, "")
+	noColor := fs.Bool("no-color", false, "")
+	pos, err := parseInterspersed(fs, args)
+	if err != nil || len(pos) < 1 || len(pos) > 2 {
+		fmt.Fprintln(os.Stderr, "usage: memstated dump [--keys] [--db PATH] PROJECT [KEYPATH]")
 		return 2
 	}
-	project := fs.Arg(0)
-	keypath := NormalizeKeypath(fs.Arg(1))
-	p := newPalette(*noColor)
-
-	store, _, err := openStoreCLI(*db)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "memstated dump: %v\n", err)
-		return 1
-	}
-	defer store.Close()
-
-	// Match the daemon's read path: soft-deleted projects are invisible
-	// until a write revives them.
-	deleted, err := store.ProjectDeleted(project)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "memstated dump: %v\n", err)
-		return 1
-	}
-	if deleted {
-		fmt.Fprintf(os.Stderr, "memstated dump: project %s is deleted\n", project)
-		if hint := projectHint(store); hint != "" {
-			fmt.Fprintf(os.Stderr, "memstated dump: %s\n", hint)
-		}
-		return 1
-	}
-
-	mems, err := store.List(project, keypath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "memstated dump: %v\n", err)
-		return 1
-	}
-	if len(mems) == 0 {
-		where := "project " + project
-		if keypath != "" {
-			where += " under " + keypath
-		}
-		fmt.Fprintf(os.Stderr, "memstated dump: no memories in %s\n", where)
-		if hint := projectHint(store); hint != "" {
-			fmt.Fprintf(os.Stderr, "memstated dump: %s\n", hint)
-		}
-		return 1
-	}
-
-	scope := project
-	if keypath != "" {
-		scope += " · " + keypath
-	}
-	fmt.Printf("%s\n\n", p.dim(fmt.Sprintf("%s — %d keypath(s)", scope, len(mems))))
+	verb := "get"
 	if *keys {
-		printKeyTree(mems, p)
-		return 0
+		verb = "tree"
 	}
-	for _, m := range mems {
-		printEntry(m, false, p)
+	cli := []string{verb}
+	if len(pos) == 2 {
+		cli = append(cli, pos[1])
 	}
-	return 0
+	cli = append(cli, "--project", pos[0])
+	if *db != "" {
+		cli = append(cli, "--db", *db)
+	}
+	if *noColor {
+		cli = append(cli, "--no-color")
+	}
+	return cmdCLI(cli)
 }
 
+// cmdSearch keeps `memstated search` as an alias of `memstate search`.
 func cmdSearch(args []string) int {
-	fs := flag.NewFlagSet("search", flag.ExitOnError)
-	db := fs.String("db", "", "SQLite file (default MEMSTATE_DB or ~/.memstate/memstate.db)")
-	project := fs.String("project", "", "restrict to one project (default: all)")
-	limit := fs.Int("limit", 20, "maximum results")
-	noColor := fs.Bool("no-color", false, "disable ANSI colors")
-	_ = fs.Parse(args)
-	query := strings.TrimSpace(strings.Join(fs.Args(), " "))
-	if query == "" || flagAfterPositional(args, fs.Args()) || *limit < 1 {
-		fmt.Fprintln(os.Stderr, "usage: memstated search [--project ID] [--limit N] [--db PATH] QUERY... (flags before args, limit >= 1)")
-		return 2
-	}
-	p := newPalette(*noColor)
-
-	store, _, err := openStoreCLI(*db)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "memstated search: %v\n", err)
-		return 1
-	}
-	defer store.Close()
-
-	mems, err := store.Search(*project, query, SearchFilter{}, *limit)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "memstated search: %v\n", err)
-		return 1
-	}
-	if len(mems) == 0 {
-		fmt.Fprintf(os.Stderr, "memstated search: no matches for %q\n", query)
-		return 1
-	}
-	fmt.Printf("%s\n\n", p.dim(fmt.Sprintf("%d match(es) for %q", len(mems), query)))
-	for _, m := range mems {
-		printEntry(m, *project == "", p)
-	}
-	return 0
+	return cmdCLI(append([]string{"search"}, args...))
 }

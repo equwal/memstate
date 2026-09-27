@@ -40,10 +40,12 @@ client/dist/index.js: client/src/index.ts client/package.json
 install: build  ## Install memstated to GOBIN and link memstate-mcp
 	@mkdir -p $(GOBIN)
 	install -m 0755 $(SERVER_BIN) $(GOBIN)/memstated
+	ln -sf $(GOBIN)/memstated $(GOBIN)/memstate
 	cd client && npm link
 	@echo
 	@echo "Installed:"
 	@echo "  $(GOBIN)/memstated"
+	@echo "  $(GOBIN)/memstate → memstated (human CLI: memstate --help)"
 	@echo "  memstate-mcp (npm global link → $(PWD)/client)"
 	@echo
 	@echo "Add to your MCP client config:"
@@ -53,7 +55,7 @@ install: build  ## Install memstated to GOBIN and link memstate-mcp
 	@echo "  claude mcp add --scope user -- memstate memstate-mcp"
 
 uninstall:  ## Remove installed binary and unlink proxy
-	-rm -f $(GOBIN)/memstated
+	-rm -f $(GOBIN)/memstated $(GOBIN)/memstate
 	-cd client && npm unlink -g @memstate/mcp
 
 install-skill:  ## Install Claude Code skill + UserPromptSubmit hooks into ~/.claude
