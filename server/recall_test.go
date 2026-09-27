@@ -290,13 +290,30 @@ func TestProjectCandidates(t *testing.T) {
 	for i, c := range got {
 		ids[i] = c.ProjectID
 	}
-	// cwd and _user dropped, "weak" (one fts hit) dropped, top 3 by count,
-	// ties by name.
-	if want := "big,also,nginx_server"; strings.Join(ids, ",") != want {
+	// Only semantic hits count: cwd and _user dropped; nginx_server, weak
+	// and big are FTS-only word matches and vanish; also (2) ranks above
+	// infra (1).
+	if want := "also,infra"; strings.Join(ids, ",") != want {
 		t.Fatalf("candidates %v want %s", ids, want)
 	}
-	if got[0].Hits != 3 || got[1].Semantic != true || got[2].Semantic != false {
+	if got[0].Hits != 2 || got[1].Hits != 1 {
 		t.Fatalf("candidate detail: %+v", got)
+	}
+	// Top three by count, ties by name.
+	many := []recallHit{
+		{ProjectID: "c", Keypath: "a", Sources: sem},
+		{ProjectID: "b", Keypath: "a", Sources: sem},
+		{ProjectID: "a", Keypath: "a", Sources: sem},
+		{ProjectID: "d", Keypath: "a", Sources: sem},
+		{ProjectID: "d", Keypath: "b", Sources: sem},
+	}
+	got = projectCandidates(many, "cwd_proj")
+	ids = ids[:0]
+	for _, c := range got {
+		ids = append(ids, c.ProjectID)
+	}
+	if want := "d,a,b"; strings.Join(ids, ",") != want {
+		t.Fatalf("top three %v want %s", ids, want)
 	}
 }
 
@@ -316,9 +333,9 @@ func TestScopeBlockText(t *testing.T) {
 			t.Fatalf("home block:\n%s", got)
 		}
 	}
-	cands := []projectCandidate{{"nginx_server", 3, true}, {"infra", 2, false}, {"one", 1, true}}
+	cands := []projectCandidate{{"nginx_server", 3}, {"infra", 2}, {"one", 1}}
 	text = scopeBlock("me", plain, cands)
-	if !strings.Contains(text, "Prompt matches other projects: nginx_server (3 hits, semantic), infra (2 hits), one (1 hit, semantic).") {
+	if !strings.Contains(text, "Prompt matches other projects: nginx_server (3 semantic hits), infra (2 semantic hits), one (1 semantic hit).") {
 		t.Fatalf("candidates line:\n%s", text)
 	}
 
@@ -368,10 +385,12 @@ func TestScopeBlockFirstPromptOnly(t *testing.T) {
 		}
 		return out.String()
 	}
+	// No embedder here: every hit is an FTS word match, so no project
+	// qualifies as a candidate, however many words it shares.
 	first := run("sc1", "help me set up my nginx config")
 	if !strings.Contains(first, `<memstate-scope cwd_project="scratch">`) ||
-		!strings.Contains(first, "nginx_server (2 hits") ||
-		strings.Contains(first, "lonely") ||
+		!strings.Contains(first, "Prompt matches no other project.") ||
+		strings.Contains(first, "nginx_server (") ||
 		!strings.Contains(first, `<memstate-recall project="scratch">`) {
 		t.Fatalf("first prompt:\n%s", first)
 	}
@@ -400,5 +419,43 @@ func TestScopeBlockFirstPromptOnly(t *testing.T) {
 	if !strings.Contains(out.String(), `<memstate-scope cwd_project="nothing_here">`) ||
 		strings.Contains(out.String(), "<memstate-recall") {
 		t.Fatalf("empty project first prompt:\n%s", out.String())
+	}
+}
+
+func TestScopeBlockSemanticCandidates(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("MEMSTATE_DB", filepath.Join(dir, "t.db"))
+	t.Setenv("MEMSTATE_NO_RECALL", "")
+	ollama := mockOllama(t)
+	defer ollama.Close()
+	embedder := newTestEmbedder(t, ollama)
+	ts := newTestServerWithEmbedder(t, embedder)
+	t.Setenv("MEMSTATE_ADDR", strings.TrimPrefix(ts.URL, "http://"))
+	// The mock embedder puts every text near every other, so each hit
+	// carries a semantic source: this checks the plumbing from the
+	// all-projects search into the block, not the ranking quality.
+	t.Setenv("MEMSTATE_SEMANTIC_THRESHOLD", "0")
+
+	cwd := filepath.Join(t.TempDir(), "scratch")
+	if err := os.Mkdir(cwd, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range [][2]string{
+		{"nginx_server", "config.sites"}, {"nginx_server", "config.tls"}, {"lonely", "notes.y"},
+	} {
+		postJSON(t, ts.URL+"/api/v1/memories/store", map[string]any{
+			"project_id": s[0], "keypath": s[1], "content": "nginx config " + s[1],
+		})
+	}
+	embedder.WaitForPending()
+
+	var out bytes.Buffer
+	event := `{"session_id":"sem1","cwd":` + jsonString(cwd) + `,"prompt":"help me set up my nginx config"}`
+	if code := runRecall(strings.NewReader(event), &out); code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+	text := out.String()
+	if !strings.Contains(text, "Prompt matches other projects: nginx_server (2 semantic hits), lonely (1 semantic hit).") {
+		t.Fatalf("semantic candidates:\n%s", text)
 	}
 }

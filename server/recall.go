@@ -163,19 +163,22 @@ const scopeMarker = "#scope"
 // projectCandidate is another project whose memories match the prompt.
 type projectCandidate struct {
 	ProjectID string
-	Hits      int
-	Semantic  bool
+	Hits      int // hits the semantic side returned
 }
 
 // projectCandidates groups all-project hits by project, drops the cwd
-// project and the user scope, and keeps a project only on real evidence:
-// two or more hits, or one hit the semantic side returned. At most three,
-// by hit count.
+// project and the user scope, and counts only hits the semantic side
+// returned. The FTS side of hybrid matches any word, so "config" or "set"
+// pulls unrelated projects; a cosine match above the threshold is the
+// evidence that a project is about the prompt. At most three, by hit count.
 func projectCandidates(hits []recallHit, cwdProject string) []projectCandidate {
 	byProject := map[string]*projectCandidate{}
 	var order []string
 	for _, h := range hits {
 		if h.ProjectID == "" || h.ProjectID == cwdProject || h.ProjectID == userProject {
+			continue
+		}
+		if !slices.Contains(h.Sources, "semantic") {
 			continue
 		}
 		c, ok := byProject[h.ProjectID]
@@ -185,16 +188,10 @@ func projectCandidates(hits []recallHit, cwdProject string) []projectCandidate {
 			order = append(order, h.ProjectID)
 		}
 		c.Hits++
-		if slices.Contains(h.Sources, "semantic") {
-			c.Semantic = true
-		}
 	}
 	var out []projectCandidate
 	for _, id := range order {
-		c := byProject[id]
-		if c.Hits >= 2 || c.Semantic {
-			out = append(out, *c)
-		}
+		out = append(out, *byProject[id])
 	}
 	slices.SortStableFunc(out, func(a, b projectCandidate) int {
 		if a.Hits != b.Hits {
@@ -227,12 +224,9 @@ func scopeBlock(project, cwd string, cands []projectCandidate) string {
 	} else {
 		parts := make([]string, len(cands))
 		for i, c := range cands {
-			s := fmt.Sprintf("%s (%d hit", c.ProjectID, c.Hits)
+			s := fmt.Sprintf("%s (%d semantic hit", c.ProjectID, c.Hits)
 			if c.Hits != 1 {
 				s += "s"
-			}
-			if c.Semantic {
-				s += ", semantic"
 			}
 			parts[i] = s + ")"
 		}
