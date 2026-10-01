@@ -34,7 +34,7 @@ build: $(SERVER_BIN) client/dist/index.js  ## Compile daemon + proxy in-place
 $(SERVER_BIN): $(shell find server -name '*.go')
 	cd server && go build -o memstated .
 
-client/dist/index.js: client/src/index.ts client/package.json
+client/dist/index.js: $(shell find client/src -name '*.ts') client/package.json client/tsconfig.json
 	cd client && npm install && npm run build
 
 install: build  ## Install memstated to GOBIN and link memstate-mcp
