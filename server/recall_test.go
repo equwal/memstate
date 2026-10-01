@@ -324,6 +324,7 @@ func TestScopeBlockText(t *testing.T) {
 		!strings.Contains(text, "is not a git repository ("+filepath.Base(plain)+")") ||
 		!strings.Contains(text, `Project "scratch" does not exist yet; a write creates it only with new_project=true.`) ||
 		!strings.Contains(text, "matches no other project") ||
+		!strings.Contains(text, "Default is the cwd project.") ||
 		!strings.HasSuffix(text, "</memstate-scope>\n") {
 		t.Fatalf("plain dir block:\n%s", text)
 	}
@@ -338,9 +339,12 @@ func TestScopeBlockText(t *testing.T) {
 	if home, err := os.UserHomeDir(); err == nil {
 		if _, isRepo := repoRoot(home); !isRepo {
 			got := scopeBlock("me", home, true, nil)
+			// The rule sentence must not contradict the line above it.
 			if !strings.Contains(got, "(home directory)") ||
 				!strings.Contains(got, "no default project for writes") ||
-				!strings.Contains(got, `scope="user"`) {
+				!strings.Contains(got, "Every write needs project_name") ||
+				!strings.Contains(got, `scope="user"`) ||
+				strings.Contains(got, "Default is the cwd project") {
 				t.Fatalf("home block:\n%s", got)
 			}
 		}

@@ -207,23 +207,40 @@ def emit(call) -> int:
         return 2
 
 
-def default_project() -> str:
-    """Project id derived from the git repo name (or cwd basename outside a
-    repo), slugged to lowercase snake_case — same rule as the TS proxy, so
-    scripts and MCP sessions land in the same project."""
-    base = ""
+def _cwd_base():
+    """(name, in_repo): the git top-level directory name when the cwd is
+    inside a repository, else the cwd name."""
     try:
         top = subprocess.run(
             ["git", "rev-parse", "--show-toplevel"],
             capture_output=True, text=True, timeout=5,
         )
-        if top.returncode == 0:
-            base = Path(top.stdout.strip()).name
+        if top.returncode == 0 and top.stdout.strip():
+            return Path(top.stdout.strip()).name, True
     except Exception:
         pass
-    if not base:
-        base = Path.cwd().name
-    return slug_name(base)
+    return Path.cwd().name, False
+
+
+def default_project() -> str:
+    """Project id derived from the git repo name (or cwd basename outside a
+    repo), slugged to lowercase snake_case — same rule as the TS proxy, so
+    scripts and MCP sessions land in the same project."""
+    return slug_name(_cwd_base()[0])
+
+
+def in_git_repo() -> bool:
+    """True when the cwd is inside a git repository: its name is intent."""
+    return _cwd_base()[1]
+
+
+def is_home_dir() -> bool:
+    """True when the cwd is the home directory, which names the user, not a
+    project."""
+    try:
+        return Path.cwd().resolve() == Path.home().resolve()
+    except Exception:
+        return False
 
 
 def slug_name(name: str) -> str:
@@ -262,6 +279,102 @@ def resolve_project(args) -> str:
             raise SystemExit("Error: pass --scope user or --project, not both")
         return USER_PROJECT
     return args.project or default_project()
+
+
+def add_write_args(ap) -> None:
+    """Add --new-project, which the two write scripts accept."""
+    ap.add_argument("--new-project", action="store_true",
+                    help="allow this write to create a project that does not exist "
+                         "yet (the git repository you are in never needs it)")
+
+
+# The near-duplicate rule folds the spellings that split one project into
+# several: underscores, digits, a trailing dev/test/tmp/old/new, one id
+# containing the other, or a small edit distance. Same rule as the TS proxy.
+def normalize_id(pid: str) -> str:
+    s = pid.replace("_", "")
+    s = re.sub(r"[0-9]", "", s)
+    return re.sub(r"(dev|test|tests|tmp|old|new)$", "", s)
+
+
+def levenshtein(a: str, b: str) -> int:
+    prev = list(range(len(b) + 1))
+    for i in range(1, len(a) + 1):
+        cur = [i] + [0] * len(b)
+        for j in range(1, len(b) + 1):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+        prev = cur
+    return prev[len(b)]
+
+
+def near_duplicates(name: str, ids: list) -> list:
+    """Existing ids that name looks like."""
+    n = normalize_id(name)
+    out = []
+    for pid in ids:
+        if pid == name:
+            continue
+        m = normalize_id(pid)
+        if n == m or (len(n) >= 4 and len(m) >= 4 and (n in m or m in n)):
+            out.append(pid)
+            continue
+        limit = 1 if min(len(n), len(m)) < 6 else 2
+        if levenshtein(n, m) <= limit:
+            out.append(pid)
+    return out
+
+
+def list_project_ids() -> list:
+    """Live project ids from the daemon. Exits 2 when it is unreachable."""
+    try:
+        out = fetch("GET", "/projects")
+    except urllib.error.URLError as e:
+        print(f"Error: could not reach memstated at {_base_url}: {e.reason}", file=sys.stderr)
+        raise SystemExit(2)
+    projects = out.get("projects") if isinstance(out, dict) else None
+    return [p["id"] for p in (projects or [])]
+
+
+def check_write_target(args, project: str) -> None:
+    """One rule for every write: it never creates a project unless it
+    targets the git repository the script runs in, or --new-project is set
+    and the id resembles no existing project. The home directory has no
+    default project for writes. Same rule as the TS proxy; the memstate CLI
+    is the human escape for a deliberate near-duplicate. Exits 1 with the
+    way out on stderr; a refusal creates nothing."""
+    if args.scope == "user":
+        return
+    explicit = bool(args.project)
+    if not explicit:
+        if in_git_repo():
+            return
+        if is_home_dir():
+            raise SystemExit(
+                "Error: the working directory is your home directory, which has no "
+                "default project for writes. Pass --project ID (an id from "
+                "memstate_get.py --list-projects, or a new id with --new-project), "
+                "or --scope user for facts about this machine")
+    ids = list_project_ids()
+    if project in ids:
+        return
+    if explicit:
+        where = f'project "{project}" does not exist'
+    else:
+        where = ("the working directory is not a git repository and its project "
+                 f'"{project}" does not exist')
+    near = near_duplicates(project, ids)
+    if near:
+        listed = ", ".join(f'"{n}"' for n in near)
+        raise SystemExit(
+            f"Error: {where} but looks like existing project {listed}; use "
+            f"--project {near[0]}. To create \"{project}\" as a separate project, "
+            "use the memstate CLI")
+    if not args.new_project:
+        raise SystemExit(
+            f"Error: {where}. Pass --project ID with an id from "
+            "memstate_get.py --list-projects, or add --new-project to create "
+            f'"{project}" (this also revives a soft-deleted project)')
 
 
 def is_other_host(keypath: str) -> bool:

@@ -19,7 +19,7 @@
  *
  * Run: node client/test/regression.mjs   (after `make build`)
  */
-import { execFileSync, spawn } from "child_process";
+import { execFileSync, spawn, spawnSync } from "child_process";
 import * as fs from "fs";
 import * as http from "http";
 import * as os from "os";
@@ -115,12 +115,14 @@ async function main() {
       "");
 
     // ---- versioned writes ------------------------------------------------
+    // The first write to a project that does not exist needs new_project.
     let r = await call(client, "memstate_set", {
       project_id: PROJECT,
       keypath: "config.alpha",
       value: "first value with zanzibar token",
       category: "config",
       topics: ["regress"],
+      new_project: true,
     });
     check("set: first write is created v1",
       !r.isError && r.data.action === "created" && r.data.stored.version === 1,
@@ -401,8 +403,17 @@ async function main() {
       keypath: "config.beta",
       value: "revive project",
     });
+    check("delete_project: a write to a soft-deleted project needs new_project",
+      r.isError && r.message.includes("new_project") && r.message.includes("revive"),
+      JSON.stringify(r));
+    r = await call(client, "memstate_set", {
+      project_id: PROJECT,
+      keypath: "config.beta",
+      value: "revive project",
+      new_project: true,
+    });
     const tree = await call(client, "memstate_get", { project_id: PROJECT });
-    check("delete_project: any write revives the project with memories intact",
+    check("delete_project: a write with new_project revives the project with memories intact",
       !r.isError && !tree.isError && tree.data.total_memories > 1,
       JSON.stringify(tree));
 
@@ -426,7 +437,7 @@ async function main() {
     check("user scope: todo write is rejected with the allowed shapes",
       r.isError && r.message.includes("allowed"),
       JSON.stringify(r));
-    r = await call(client, "memstate_set", { project_id: "_scratch", keypath: "preferences.x", value: "nope" });
+    r = await call(client, "memstate_set", { project_id: "_scratch", keypath: "preferences.x", value: "nope", new_project: true });
     check("user scope: other reserved ids are rejected",
       r.isError && r.message.includes("reserved"),
       JSON.stringify(r));
@@ -500,7 +511,7 @@ async function main() {
     check("instructions: describe the session project override",
       instr.includes("Session project") && instr.includes("new_project"),
       "");
-    r = await call(client, "memstate_set", { project_id: "other_proj", keypath: "notes.a", value: "seed" });
+    r = await call(client, "memstate_set", { project_id: "other_proj", keypath: "notes.a", value: "seed", new_project: true });
     check("session: seed another project", !r.isError, JSON.stringify(r));
     r = await call(client, "memstate_get", { project_name: "nope_project" });
     check("session: an unknown project_name needs new_project",
@@ -640,11 +651,72 @@ async function main() {
           JSON.stringify(f));
       });
     }
+    // Explicit project_id follows the same rule: no creation without
+    // new_project=true, and a near-duplicate is refused outright.
+    r = await call(client, "memstate_set", { project_id: "fresh_explicit", keypath: "notes.a", value: "v" });
+    check("gate: an explicit project_id that does not exist is refused without new_project",
+      r.isError && r.message.includes("new_project") && r.message.includes('"fresh_explicit"'),
+      JSON.stringify(r));
+    r = await call(client, "memstate_set", { project_id: "regress_tests", keypath: "notes.a", value: "v", new_project: true });
+    check("gate: an explicit near-duplicate id is refused even with new_project",
+      r.isError && r.message.includes(`"${PROJECT}"`) && r.message.includes("memstate CLI"),
+      JSON.stringify(r));
+    r = await call(client, "memstate_remember", { project_id: "fresh_explicit", content: "## Notes\nbody\n", new_project: true });
+    check("gate: new_project=true creates an explicit project",
+      !r.isError && r.data.items[0].stored.project_id === "fresh_explicit",
+      JSON.stringify(r));
+    r = await call(client, "memstate_set", { project_id: "fresh_explicit", keypath: "notes.b", value: "w" });
+    check("gate: an existing explicit project needs no flag",
+      !r.isError && r.data.stored.project_id === "fresh_explicit",
+      JSON.stringify(r));
+
+    // The Python skill scripts apply the same rule, one-shot, with
+    // --new-project. Each run spawns its own child daemon on the same DB.
+    const PY = process.platform === "win32" ? "python" : "python3";
+    const SET_PY = path.resolve(__dirname, "..", "skill", "scripts", "memstate_set.py");
+    const py = (cwd, args) => {
+      const out = spawnSync(PY, [SET_PY, ...args], { cwd, env, encoding: "utf8" });
+      return { code: out.status, err: out.stderr, out: out.stdout };
+    };
+    const pyCwd = path.join(tmp, "gate_py");
+    fs.mkdirSync(pyCwd);
+    let p = py(pyCwd, ["--keypath", "notes.a", "--value", "v"]);
+    check("gate (python): a write that would create the cwd project is refused",
+      p.code !== 0 && p.err.includes("--new-project") && p.err.includes('"gate_py"'),
+      JSON.stringify(p));
+    p = py(pyCwd, ["--keypath", "notes.a", "--value", "v", "--new-project"]);
+    check("gate (python): --new-project creates the cwd project",
+      p.code === 0 && p.out.includes('"gate_py"'),
+      JSON.stringify(p));
+    p = py(pyCwd, ["--keypath", "notes.b", "--value", "w"]);
+    check("gate (python): once the project exists, writes need no flag",
+      p.code === 0,
+      JSON.stringify(p));
+    p = py(nearCwd, ["--keypath", "notes.a", "--value", "v", "--new-project"]);
+    check("gate (python): a cwd that looks like an existing project is refused",
+      p.code !== 0 && p.err.includes(`"${PROJECT}"`),
+      JSON.stringify(p));
+    p = py(pyCwd, ["--project", "fresh_py", "--keypath", "notes.a", "--value", "v"]);
+    check("gate (python): an explicit project that does not exist is refused without --new-project",
+      p.code !== 0 && p.err.includes("--new-project"),
+      JSON.stringify(p));
+    if (!homeIsRepo) {
+      p = py(os.homedir(), ["--keypath", "notes.a", "--value", "v", "--new-project"]);
+      check("gate (python): a write from the home directory is refused",
+        p.code !== 0 && p.err.includes("home directory"),
+        JSON.stringify(p));
+      p = py(os.homedir(), ["--scope", "user", "--keypath", "preferences.gate_py", "--value", "v"]);
+      check("gate (python): the user scope is open from the home directory",
+        p.code === 0,
+        JSON.stringify(p));
+    }
+
     const after = await call(client, "memstate_get", { list_projects: true });
     const afterIds = after.data.projects.map((p) => p.id);
     const homeId = path.basename(os.homedir()).toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
     check("gate: refused writes created no project",
-      afterIds.includes("gate_dir") && !afterIds.includes("regress_tests") &&
+      afterIds.includes("gate_dir") && afterIds.includes("fresh_explicit") && afterIds.includes("gate_py") &&
+        !afterIds.includes("regress_tests") && !afterIds.includes("fresh_py") &&
         (homeIsRepo || !afterIds.includes(homeId)),
       afterIds.join(","));
 

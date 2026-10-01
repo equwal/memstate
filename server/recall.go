@@ -216,9 +216,12 @@ func projectCandidates(hits []recallHit, cwdProject string) []projectCandidate {
 func scopeBlock(project, cwd string, exists bool, cands []projectCandidate) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "<memstate-scope cwd_project=%q exists=\"%t\">\n", project, exists)
-	if root, ok := repoRoot(cwd); ok {
+	root, inRepo := repoRoot(cwd)
+	home, err := os.UserHomeDir()
+	isHome := !inRepo && err == nil && filepath.Clean(cwd) == filepath.Clean(home)
+	if inRepo {
 		fmt.Fprintf(&b, "The working directory is the git repository %s.\n", filepath.Base(root))
-	} else if home, err := os.UserHomeDir(); err == nil && filepath.Clean(cwd) == filepath.Clean(home) {
+	} else if isHome {
 		// The home directory names the user, not a project. The proxy
 		// refuses writes to its default there; say so before the first write.
 		b.WriteString("The working directory is not a git repository (home directory). " +
@@ -244,10 +247,18 @@ func scopeBlock(project, cwd string, exists bool, cands []projectCandidate) stri
 		}
 		fmt.Fprintf(&b, "Prompt matches other projects: %s.\n", strings.Join(parts, ", "))
 	}
-	b.WriteString("Default is the cwd project. Override only when this prompt is clearly about " +
-		"another subject: pass project_name=<one of the ids above, or another id from " +
-		"memstate_get(list_projects=true)> on your first memstate call. Do not invent a " +
-		"new name unless nothing fits; then add new_project=true.\n")
+	// The rule sentence must agree with the line above it: the home
+	// directory has no default for writes, every other directory does.
+	if isHome {
+		b.WriteString("Reads use the cwd project. Every write needs project_name=<one of the ids " +
+			"above, or another id from memstate_get(list_projects=true)> or scope=\"user\". " +
+			"Do not invent a new name unless nothing fits; then add new_project=true.\n")
+	} else {
+		b.WriteString("Default is the cwd project. Override only when this prompt is clearly about " +
+			"another subject: pass project_name=<one of the ids above, or another id from " +
+			"memstate_get(list_projects=true)> on your first memstate call. Do not invent a " +
+			"new name unless nothing fits; then add new_project=true.\n")
+	}
 	b.WriteString("</memstate-scope>\n")
 	return b.String()
 }

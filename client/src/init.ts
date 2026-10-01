@@ -76,10 +76,11 @@ always right. When the prompt is clearly about another subject (for example
 with \`project_name\` on your first memstate call. Prefer an id that
 \`memstate_get(list_projects=true)\` lists. A new id also needs
 \`new_project=true\` and is refused when it looks like an existing id. Never
-invent a variant of an existing name. Outside a git repository a write that
-would create the cwd default project needs \`new_project=true\`; from the
-home directory there is no default project for writes, so pin a project or
-use the user scope.
+invent a variant of an existing name. A write never creates a project
+unless it targets the git repository you are in or carries
+\`new_project=true\`; this also covers an explicit project_id. A name that
+resembles an existing project is refused. From the home directory there is
+no default project for writes, so pin a project or use the user scope.
 
 ## Tools
 

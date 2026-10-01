@@ -172,10 +172,10 @@ const NEW_PROJECT_PROP = {
   type: "boolean",
   default: false,
   description:
-    "With project_name: allow a project id that does not exist yet. " +
-    "Without project_name, on a write outside a git repository: allow this " +
-    "call to create the cwd default project. Either way the id is refused " +
-    "when it looks like a misspelling of an existing project.",
+    "Allow this call to create a project that does not exist yet, or revive " +
+    "a soft-deleted one: with project_name, or on a write with project_id " +
+    "or with the cwd default outside a git repository. Refused when the id " +
+    "looks like a misspelling of an existing project.",
 };
 
 let sessionProject = "";
@@ -248,6 +248,7 @@ async function pinSession(a: ToolArgs): Promise<void> {
   if (name === sessionProject) return;
   const ids = await listProjectIds();
   if (ids.includes(name)) {
+    knownProjects.add(name);
     sessionProject = name;
     return;
   }
@@ -267,54 +268,65 @@ async function pinSession(a: ToolArgs): Promise<void> {
   sessionProject = name;
 }
 
-// defaultProjectExists caches a positive /projects answer: once the cwd
-// default project is known to exist, writes to it need no further check.
-let defaultProjectExists = false;
+// knownProjects caches positive /projects answers: a project seen there
+// needs no further check in this process. memstate_delete_project removes
+// its id, so a revive needs new_project=true like any other creation.
+const knownProjects = new Set<string>();
 
-// checkDefaultWrite gates a write to the cwd default project. Inside a git
-// repository the repository name is intent, so nothing is checked. Outside
-// one the directory name is a guess: the project must exist already, or the
-// call must carry new_project=true, and the id must not resemble an existing
-// project. The home directory names the user, so it never gets a default
-// project for writes. Refusals create nothing.
-async function checkDefaultWrite(a: ToolArgs): Promise<void> {
-  if (CWD_IN_REPO || defaultProjectExists) return;
-  if (CWD_IS_HOME) {
-    throw new Error(
-      "the working directory is your home directory, which has no default " +
-        "project for writes. Pin a project with project_name (an id from " +
-        "memstate_get(list_projects=true), or a new id with new_project=true), " +
-        'or use scope="user" for facts about this machine'
-    );
+// checkWriteTarget enforces the one creation rule for writes: a write never
+// creates a project unless it targets the git repository this session runs
+// in, or the call carries new_project=true and the id resembles no existing
+// project. The home directory names the user, so its default is refused
+// outright. A deliberate near-duplicate needs the memstate CLI, which is a
+// human's tool. Refusals create nothing; a successful create is not cached,
+// so the next write asks /projects again and finds the project.
+async function checkWriteTarget(id: string, a: ToolArgs, explicit: boolean): Promise<void> {
+  if (!explicit) {
+    if (CWD_IN_REPO) return;
+    if (CWD_IS_HOME) {
+      throw new Error(
+        "the working directory is your home directory, which has no default " +
+          "project for writes. Pin a project with project_name (an id from " +
+          "memstate_get(list_projects=true), or a new id with new_project=true), " +
+          'or use scope="user" for facts about this machine'
+      );
+    }
   }
+  if (knownProjects.has(id)) return;
   const ids = await listProjectIds();
-  if (ids.includes(DEFAULT_PROJECT)) {
-    defaultProjectExists = true;
+  if (ids.includes(id)) {
+    knownProjects.add(id);
     return;
   }
-  const near = nearDuplicates(DEFAULT_PROJECT, ids);
+  const where = explicit
+    ? `project "${id}" does not exist`
+    : `the working directory is not a git repository and its project "${id}" does not exist`;
+  const near = nearDuplicates(id, ids);
   if (near.length > 0) {
+    const fix = explicit
+      ? `use project_id="${near[0]}"`
+      : `pin the session with project_name="${near[0]}"`;
     throw new Error(
-      `the working directory is not a git repository, and its project "${DEFAULT_PROJECT}" ` +
-        `does not exist but looks like existing project ${near.map((id) => `"${id}"`).join(", ")}; ` +
-        `pin the session with project_name="${near[0]}", or pass project_id for a truly different project`
+      `${where} but looks like existing project ${near.map((n) => `"${n}"`).join(", ")}; ${fix}. ` +
+        `To create "${id}" as a separate project, use the memstate CLI`
     );
   }
   if (a.new_project !== true) {
+    const other = explicit
+      ? "Pass an id from memstate_get(list_projects=true)"
+      : "Pass project_name=<an id from memstate_get(list_projects=true)> to use another project";
     throw new Error(
-      `the working directory is not a git repository and no project "${DEFAULT_PROJECT}" exists. ` +
-        "Pass project_name=<an id from memstate_get(list_projects=true)> to use another project, " +
-        `new_project=true to create "${DEFAULT_PROJECT}", or scope="user" for facts about this machine`
+      `${where}. ${other}, new_project=true to create "${id}" (this also revives a ` +
+        `soft-deleted project), or scope="user" for facts about this machine`
     );
   }
-  // Allowed. The next write without the flag asks /projects again and
-  // finds the project, so a failed create never marks it as existing.
 }
 
 // resolveProject picks the project id for a call: the reserved user
 // project for scope "user", else the explicit id, else the session pin,
-// else this directory's. A write that lands on the directory default
-// passes checkDefaultWrite first.
+// else this directory's. A write to an explicit id or to the directory
+// default passes checkWriteTarget first; a pinned project was checked at
+// pin time.
 async function resolveProject(a: ToolArgs, write = false): Promise<string> {
   if (a.project_name !== undefined) {
     await pinSession(a);
@@ -328,9 +340,13 @@ async function resolveProject(a: ToolArgs, write = false): Promise<string> {
   if (a.scope !== undefined && a.scope !== "project") {
     throw new Error(`unknown scope ${JSON.stringify(a.scope)}; use "project" or "user"`);
   }
-  if (a.project_id) return String(a.project_id);
+  if (a.project_id) {
+    const id = String(a.project_id);
+    if (write) await checkWriteTarget(id, a, true);
+    return id;
+  }
   if (sessionProject) return sessionProject;
-  if (write) await checkDefaultWrite(a);
+  if (write) await checkWriteTarget(DEFAULT_PROJECT, a, false);
   return DEFAULT_PROJECT;
 }
 
@@ -1082,7 +1098,10 @@ const TOOLS: ToolDef[] = [
       properties: { project_id: { type: "string" } },
       required: ["project_id"],
     },
-    handler: (a) => postJSON("/projects/delete", a),
+    handler: (a) => {
+      knownProjects.delete(String(a.project_id));
+      return postJSON("/projects/delete", a);
+    },
   },
 ];
 
@@ -1175,12 +1194,13 @@ Session project — when the prompt is not about this directory:
   invent a variant of an existing name.
 - One pin per session; a different project_name later is an error. Pass
   project_id to reach another project for one call.
-- Outside a git repository the directory name is not a project. A write
-  (memstate_set, memstate_remember) to the cwd default is refused until
-  that project exists: pin an existing project with project_name, or pass
-  new_project=true once to create "${DEFAULT_PROJECT}" when nothing fits.
-  A directory name that resembles an existing project is refused; pin the
-  existing project instead. Reads and explicit project_id are free.
+- One rule for creating projects: a write (memstate_set, memstate_remember)
+  never creates a project unless it targets the git repository this
+  session runs in, or the call carries new_project=true. This holds for
+  the cwd default outside a git repository, for an explicit project_id,
+  and for a soft-deleted project (new_project=true revives it). A name
+  that resembles an existing project is always refused: use the existing
+  project. Reads are never gated, and a refusal creates nothing.
 - The home directory has no default project for writes at all: pin with
   project_name, or use scope="user" for facts about this machine.`;
 
