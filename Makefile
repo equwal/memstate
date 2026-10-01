@@ -50,6 +50,7 @@ LS          := dir
 SMOKE_ENV   := set "MEMSTATE_ADDR=" && set "MEMSTATE_NO_UPDATE_CHECK=1" &&
 MATCH_Q     = findstr /R "$1" >NUL
 XBUILD      = cd server && set "CGO_ENABLED=0" && set "GOOS=$1" && set "GOARCH=$2" && go build -trimpath -ldflags="-s -w" -o ../$(DIST)/$3 .
+VET_OTHER   = cd server && set "GOOS=linux" && go vet ./...
 HELP        = findstr /R "^[a-z_-]*:.*\#\#" $(MAKEFILE_LIST)
 else
 P           = $1
@@ -65,6 +66,7 @@ LS          := ls -l
 SMOKE_ENV   := env -u MEMSTATE_ADDR MEMSTATE_NO_UPDATE_CHECK=1
 MATCH_Q     = grep -q '$1'
 XBUILD      = cd server && CGO_ENABLED=0 GOOS=$1 GOARCH=$2 go build -trimpath -ldflags="-s -w" -o ../$(DIST)/$3 .
+VET_OTHER   = cd server && GOOS=windows go vet ./...
 HELP        = awk 'BEGIN{FS=":.*?\#\#"} /^[a-zA-Z_-]+:.*?\#\#/ {printf "  %-14s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 endif
 
@@ -145,6 +147,7 @@ uninstall-skill:  ## Remove skill + hooks from ~/.claude
 
 test: build  ## Run Go tests + TS end-to-end smoke + MCP regression
 	cd server && go test ./... && go vet ./...
+	$(VET_OTHER)
 	node client/dist/index.js --test
 	$(SMOKE_ENV) node client/dist/index.js --test --embed-model memstate-smoke-model | $(call MATCH_Q,embed_model.:.memstate-smoke-model)
 	node client/test/regression.mjs

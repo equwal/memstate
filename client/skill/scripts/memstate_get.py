@@ -16,7 +16,8 @@ import urllib.error
 import urllib.parse
 
 from _client import (USER_PROJECT, add_scope_args, count_values, emit, fetch,
-                     get, host_slug, prune_other_hosts, resolve_project)
+                     get, host_slug, list_projects_visible, prune_other_hosts,
+                     resolve_project)
 
 
 def _tree(project: str) -> dict:
@@ -46,7 +47,7 @@ def main() -> int:
     args = ap.parse_args()
 
     if args.list_projects:
-        return get("/projects")
+        return emit(list_projects_visible)
 
     if args.memory_id is not None:
         return get(f"/memories/{args.memory_id}")

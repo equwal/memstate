@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -339,8 +340,11 @@ func TestScopeBlockText(t *testing.T) {
 	if home, err := os.UserHomeDir(); err == nil {
 		if _, isRepo := repoRoot(home); !isRepo {
 			got := scopeBlock("me", home, true, nil)
-			// The rule sentence must not contradict the line above it.
-			if !strings.Contains(got, "(home directory)") ||
+			// The rule sentence must not contradict the line above it, and
+			// exists= is noise where no write can land.
+			if !strings.HasPrefix(got, "<memstate-scope cwd_project=\"me\">\n") ||
+				strings.Contains(got, "exists=") ||
+				!strings.Contains(got, "(home directory)") ||
 				!strings.Contains(got, "no default project for writes") ||
 				!strings.Contains(got, "Every write needs project_name") ||
 				!strings.Contains(got, `scope="user"`) ||
@@ -473,5 +477,51 @@ func TestScopeBlockSemanticCandidates(t *testing.T) {
 	text := out.String()
 	if !strings.Contains(text, "Prompt matches other projects: nginx_server (2 semantic hits), lonely (1 semantic hit).") {
 		t.Fatalf("semantic candidates:\n%s", text)
+	}
+}
+
+func TestPinnedProject(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("MEMSTATE_DB", filepath.Join(dir, "t.db"))
+	cwd := filepath.Join(dir, "work")
+	if err := os.Mkdir(cwd, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := pinnedProject(cwd); got != "" {
+		t.Fatalf("no pins dir: got %q", got)
+	}
+	pins := filepath.Join(dir, "recall", "pins")
+	if err := os.MkdirAll(pins, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write := func(name, content string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(pins, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A live proxy (this test process) pinned another directory: ignored.
+	write(strconv.Itoa(os.Getpid()), filepath.Join(dir, "elsewhere")+"\nother\n")
+	if got := pinnedProject(cwd); got != "" {
+		t.Fatalf("other cwd: got %q", got)
+	}
+	// A dead proxy pinned this directory: ignored and pruned.
+	write("999999999", cwd+"\ndead_pin\n")
+	if got := pinnedProject(cwd); got != "" {
+		t.Fatalf("dead pid: got %q", got)
+	}
+	if _, err := os.Stat(filepath.Join(pins, "999999999")); !os.IsNotExist(err) {
+		t.Fatalf("dead pin file not pruned: %v", err)
+	}
+	// A live proxy pinned this directory: that project wins.
+	write(strconv.Itoa(os.Getpid()), cwd+"\nnginx_server\n")
+	if got := pinnedProject(cwd); got != "nginx_server" {
+		t.Fatalf("live pin: got %q", got)
+	}
+	// Garbage in the directory never breaks the hook.
+	write("notapid", "junk")
+	write(strconv.Itoa(os.Getpid()), "")
+	if got := pinnedProject(cwd); got != "" {
+		t.Fatalf("garbage: got %q", got)
 	}
 }

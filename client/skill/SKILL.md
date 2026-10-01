@@ -134,14 +134,19 @@ first tool call. An existing id pins freely. A new id also needs
 One rule for creating projects, enforced by the proxy and by these
 scripts alike: a write never creates a project unless it targets the git
 repository you are in, or the call carries `new_project=true` (scripts:
-`--new-project`). This holds for the cwd default outside a repository, for
+`--new-project`). This holds for the cwd project outside a repository, for
 an explicit project id, and for a soft-deleted project, which the flag
 revives. A name that resembles an existing project is refused outright;
 use the existing project, or create the new one with the `memstate` CLI,
 which is the human escape. The home directory has no default project for
-writes: pin a project or use the user scope. Reads are never gated. These
-scripts are one-shot and have no session: pass `--project` instead of
-`project_name`.
+writes, and its name is never accepted as a project: pin a project or use
+the user scope. Ids that start with `_` are reserved; the user scope is
+`--scope user`, never `--project`, and `--list-projects` does not show it.
+`--new-project` is an error where nothing can be created (`--scope user`,
+or the git repository you are in). Reads are never gated. These scripts
+are one-shot and have no session: pass `--project` instead of
+`project_name`. A pinned MCP session publishes its pin for the recall hook
+as `<db dir>/recall/pins/<pid>`, removed when the proxy exits.
 
 ## Workflows
 

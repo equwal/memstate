@@ -455,7 +455,7 @@ async function main() {
       !r.isError && r.data.action === "created",
       JSON.stringify(r));
     r = await call(client, "memstate_set", {
-      project_id: "_user", keypath: "host.other_box.env.go_bin",
+      scope: "user", keypath: "host.other_box.env.go_bin",
       value: "go binaries live in /opt/go/bin on the other box",
     });
     check("user scope: another host's env write is accepted",
@@ -526,7 +526,11 @@ async function main() {
       r.isError && r.message.includes('"other_proj"'),
       JSON.stringify(r));
     r = await call(client, "memstate_get", { project_name: "_user" });
-    check("session: a reserved or malformed name is refused",
+    check("session: a reserved name is refused with a pointer to scope=user",
+      r.isError && r.message.includes('scope="user"'),
+      JSON.stringify(r));
+    r = await call(client, "memstate_get", { project_name: "Bad-Name" });
+    check("session: a malformed name is refused",
       r.isError && r.message.includes("snake_case"),
       JSON.stringify(r));
     r = await call(client, "memstate_set", {
@@ -578,7 +582,19 @@ async function main() {
       check("session: search without project_id uses the pin",
         !f.isError && f.data.results.length === 1 && f.data.results[0].project_id === "other_proj",
         JSON.stringify(f));
+      // The pin is published for the recall hook: one file per proxy
+      // process under <db dir>/recall/pins, "cwd\nproject\n".
+      const pinned = readPins(tmp);
+      check("session: a pin writes a pin file for the recall hook",
+        pinned.some((l) => l[0] === fs.realpathSync(freshCwd) && l[1] === "other_proj"),
+        JSON.stringify(pinned));
     });
+    // Only the closed proxy's file goes; the main proxy's own pin stays.
+    const freshPin = (l) => l[0] === fs.realpathSync(freshCwd);
+    await waitFor(() => !readPins(tmp).some(freshPin), 3000);
+    check("session: the pin file is removed when the proxy exits",
+      !readPins(tmp).some(freshPin),
+      JSON.stringify(readPins(tmp)));
 
     // ---- project creation gate ------------------------------------------------
     // Outside a git repository the directory name is not a project. A write
@@ -634,12 +650,17 @@ async function main() {
     } catch {
       homeIsRepo = false;
     }
+    const homeId = path.basename(os.homedir()).toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
     if (!homeIsRepo) {
       await withProxy(env, os.homedir(), async (h) => {
         let f = await call(h, "memstate_set", { keypath: "notes.a", value: "v", new_project: true });
         check("gate: a write from the home directory is refused even with new_project",
           f.isError && f.message.includes("home directory") && f.message.includes("project_name") &&
             f.message.includes('scope="user"'),
+          JSON.stringify(f));
+        f = await call(h, "memstate_get", { project_name: homeId, new_project: true });
+        check("home: the home directory's name is refused as a pin",
+          f.isError && f.message.includes("home directory") && f.message.includes('scope="user"'),
           JSON.stringify(f));
         f = await call(h, "memstate_set", { scope: "user", keypath: "preferences.gate", value: "v" });
         check("gate: the user scope is open from the home directory",
@@ -711,9 +732,63 @@ async function main() {
         JSON.stringify(p));
     }
 
+    if (!homeIsRepo) {
+      r = await call(client, "memstate_set", { project_id: homeId, keypath: "notes.a", value: "v", new_project: true });
+      check("home: the home directory's name is refused as an explicit write target",
+        r.isError && r.message.includes("home directory"),
+        JSON.stringify(r));
+      r = await call(client, "memstate_get", { project_id: homeId });
+      check("home: reading the home directory's name stays possible for migration",
+        !r.isError,
+        JSON.stringify(r));
+      p = py(pyCwd, ["--project", homeId, "--keypath", "notes.a", "--value", "v", "--new-project"]);
+      check("home (python): the home directory's name is refused as an explicit write target",
+        p.code !== 0 && p.err.includes("home directory"),
+        JSON.stringify(p));
+    }
+
+    // Ids that start with "_" are reserved; the user scope is scope="user".
+    r = await call(client, "memstate_get", { project_id: "_user" });
+    check("reserved: project_id _user is refused with a pointer to scope=user",
+      r.isError && r.message.includes('scope="user"'),
+      JSON.stringify(r));
+    const listed = await call(client, "memstate_get", { list_projects: true });
+    check("reserved: list_projects hides _user",
+      !listed.isError && listed.data.projects.length > 0 && !listed.data.projects.some((q) => q.id.startsWith("_")),
+      JSON.stringify(listed.data.projects.map((q) => q.id)));
+    p = py(pyCwd, ["--project", "_user", "--keypath", "preferences.x", "--value", "v"]);
+    check("reserved (python): --project _user is refused with a pointer to --scope user",
+      p.code !== 0 && p.err.includes("--scope user"),
+      JSON.stringify(p));
+    const GET_PY = path.resolve(__dirname, "..", "skill", "scripts", "memstate_get.py");
+    const pl = spawnSync(PY, [GET_PY, "--list-projects"], { cwd: pyCwd, env, encoding: "utf8" });
+    check("reserved (python): --list-projects hides _user",
+      pl.status === 0 && !JSON.parse(pl.stdout).projects.some((q) => q.id.startsWith("_")),
+      JSON.stringify({ code: pl.status, out: pl.stdout.slice(0, 200), err: pl.stderr }));
+
+    // new_project where nothing can be created is a mistake, not a no-op.
+    r = await call(client, "memstate_get", { new_project: true });
+    check("new_project: refused on a read without project_name",
+      r.isError && r.message.includes("no effect"),
+      JSON.stringify(r));
+    r = await call(client, "memstate_set", { scope: "user", keypath: "preferences.flag", value: "v", new_project: true });
+    check("new_project: refused with scope=user",
+      r.isError && r.message.includes("no effect"),
+      JSON.stringify(r));
+    const repoCwd = path.resolve(__dirname, "..", "..");
+    await withProxy(env, repoCwd, async (repo) => {
+      const f = await call(repo, "memstate_set", { keypath: "notes.flag", value: "v", new_project: true });
+      check("new_project: refused for the git repository's own project",
+        f.isError && f.message.includes("no effect"),
+        JSON.stringify(f));
+    });
+    const pr = spawnSync(PY, [SET_PY, "--keypath", "notes.flag", "--value", "v", "--new-project"], { cwd: repoCwd, env, encoding: "utf8" });
+    check("new_project (python): refused for the git repository's own project",
+      pr.status !== 0 && pr.stderr.includes("no effect"),
+      JSON.stringify({ code: pr.status, err: pr.stderr }));
+
     const after = await call(client, "memstate_get", { list_projects: true });
     const afterIds = after.data.projects.map((p) => p.id);
-    const homeId = path.basename(os.homedir()).toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
     check("gate: refused writes created no project",
       afterIds.includes("gate_dir") && afterIds.includes("fresh_explicit") && afterIds.includes("gate_py") &&
         !afterIds.includes("regress_tests") && !afterIds.includes("fresh_py") &&
@@ -733,14 +808,10 @@ async function main() {
     await withSharedDaemon(env, async () => {
       const cwd = path.join(tmp, "regress-test");
       fs.mkdirSync(cwd);
-      const recall = (session) =>
+      const recall = (session, prompt = "why did we choose sqlite for the store") =>
         execFileSync(DAEMON, ["recall"], {
           env,
-          input: JSON.stringify({
-            session_id: session,
-            cwd,
-            prompt: "why did we choose sqlite for the store",
-          }),
+          input: JSON.stringify({ session_id: session, cwd, prompt }),
         }).toString();
       const first = recall("regress_s1");
       check("recall: finds the shared daemon via daemon.addr and injects a hit",
@@ -756,6 +827,20 @@ async function main() {
       check("recall: a new session sees the keypath again",
         recall("regress_s2").includes("### decisions"),
         "");
+      // A live pin file for this cwd redirects recall to the pinned project;
+      // a dead one is pruned.
+      const pinsDir = path.join(tmp, "recall", "pins");
+      fs.mkdirSync(pinsDir, { recursive: true });
+      fs.writeFileSync(path.join(pinsDir, String(process.pid)), `${cwd}\nother_proj\n`);
+      fs.writeFileSync(path.join(pinsDir, "999999999"), `${cwd}\ndead_pin\n`);
+      const pinnedOut = recall("regress_s3", "the seed note for the other project please");
+      check("recall: a live pin file redirects recall to the pinned project",
+        pinnedOut.includes(`<memstate-recall project="other_proj">`) && pinnedOut.includes("seed"),
+        JSON.stringify(pinnedOut));
+      check("recall: a dead pin file is pruned",
+        !fs.existsSync(path.join(pinsDir, "999999999")),
+        "");
+      fs.rmSync(path.join(pinsDir, String(process.pid)), { force: true });
     });
   } finally {
     clearTimeout(watchdog);
@@ -772,6 +857,20 @@ async function main() {
     process.exit(1);
   }
   process.stdout.write("\nall regression checks passed\n");
+}
+
+// readPins lists the recall pin files under <db dir>/recall/pins as
+// [cwd, project] pairs.
+function readPins(dbDir) {
+  const dir = path.join(dbDir, "recall", "pins");
+  if (!fs.existsSync(dir)) return [];
+  return fs.readdirSync(dir).map((n) => fs.readFileSync(path.join(dir, n), "utf8").split("\n"));
+}
+
+// waitFor polls cond until it holds or ms elapse.
+async function waitFor(cond, ms) {
+  const end = Date.now() + ms;
+  while (!cond() && Date.now() < end) await new Promise((r) => setTimeout(r, 50));
 }
 
 // withProxy connects a second, fresh proxy (own process, own session pin)

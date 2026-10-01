@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -76,7 +77,14 @@ func runRecall(stdin io.Reader, stdout io.Writer) int {
 		debug("no shared daemon found")
 		return 0
 	}
-	project := deriveProject(ev.Cwd)
+	// The cwd project is the default. A live proxy in this directory may
+	// have pinned another project; recall follows the pin, the scope block
+	// keeps describing the directory.
+	cwdProject := deriveProject(ev.Cwd)
+	project := cwdProject
+	if pinned := pinnedProject(ev.Cwd); pinned != "" {
+		project = pinned
+	}
 	hits, err := recallSearch(addr, project, ev.Prompt)
 	if err != nil {
 		debug("search: %v", err)
@@ -97,11 +105,11 @@ func runRecall(stdin io.Reader, stdout io.Writer) int {
 			debug("all-projects search: %v", err)
 			all = nil
 		}
-		exists, err := recallProjectExists(addr, project)
+		exists, err := recallProjectExists(addr, cwdProject)
 		if err != nil {
 			debug("projects: %v", err)
 		}
-		out.WriteString(scopeBlock(project, ev.Cwd, exists, projectCandidates(all, project)))
+		out.WriteString(scopeBlock(cwdProject, ev.Cwd, exists, projectCandidates(all, cwdProject)))
 		shown = append(shown, scopeMarker)
 	}
 
@@ -215,10 +223,16 @@ func projectCandidates(hits []recallHit, cwdProject string) []projectCandidate {
 // new name is a deliberate second step (new_project=true in the proxy).
 func scopeBlock(project, cwd string, exists bool, cands []projectCandidate) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "<memstate-scope cwd_project=%q exists=\"%t\">\n", project, exists)
 	root, inRepo := repoRoot(cwd)
 	home, err := os.UserHomeDir()
 	isHome := !inRepo && err == nil && filepath.Clean(cwd) == filepath.Clean(home)
+	// No write can land in the home directory's project, so whether it
+	// exists is noise there.
+	if isHome {
+		fmt.Fprintf(&b, "<memstate-scope cwd_project=%q>\n", project)
+	} else {
+		fmt.Fprintf(&b, "<memstate-scope cwd_project=%q exists=\"%t\">\n", project, exists)
+	}
 	if inRepo {
 		fmt.Fprintf(&b, "The working directory is the git repository %s.\n", filepath.Base(root))
 	} else if isHome {
@@ -274,6 +288,60 @@ func slugProject(name string) string {
 // recallSearch runs a hybrid search on the daemon at addr. Any non-200
 // reply is an error, including "unknown mode" from a daemon that predates
 // hybrid search.
+// pinnedProject returns the project that a live MCP proxy running in cwd
+// pinned with project_name, or "". The proxy writes one file per process
+// under <db dir>/recall/pins, named by its PID and holding "cwd\nproject\n",
+// and removes it on exit. A file whose PID is dead is pruned here. When
+// several live proxies share a cwd, the newest file wins.
+func pinnedProject(cwd string) string {
+	dir := filepath.Join(filepath.Dir(defaultDBPath()), "recall", "pins")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return ""
+	}
+	var best string
+	var bestTime time.Time
+	for _, e := range entries {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil || e.IsDir() {
+			continue
+		}
+		path := filepath.Join(dir, e.Name())
+		if !processAlive(pid) {
+			_ = os.Remove(path)
+			continue
+		}
+		b, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		lines := strings.SplitN(strings.TrimRight(string(b), "\n"), "\n", 2)
+		if len(lines) != 2 || lines[1] == "" || !sameDir(lines[0], cwd) {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if best == "" || info.ModTime().After(bestTime) {
+			best, bestTime = lines[1], info.ModTime()
+		}
+	}
+	return best
+}
+
+// sameDir compares two directory paths with symlinks resolved, so a cwd
+// reported as /var/x and one as /private/var/x (macOS) are equal.
+func sameDir(a, b string) bool {
+	resolve := func(p string) string {
+		if r, err := filepath.EvalSymlinks(p); err == nil {
+			return filepath.Clean(r)
+		}
+		return filepath.Clean(p)
+	}
+	return resolve(a) == resolve(b)
+}
+
 // recallProjectExists reports whether the daemon lists project as live.
 func recallProjectExists(addr, project string) (bool, error) {
 	client := &http.Client{Timeout: recallTimeout}

@@ -265,7 +265,8 @@ def host_slug() -> str:
 def add_scope_args(ap) -> None:
     """Add the --project / --scope pair every script accepts."""
     ap.add_argument("--project", default=None,
-                    help="project id (default: derived from repo/dir name)")
+                    help="project id (default: the cwd project, derived from the git "
+                         "repository or directory name; ids that start with _ are reserved)")
     ap.add_argument("--scope", choices=("project", "user"), default="project",
                     help="'user' targets the reserved user scope (facts about "
                          "the user or this machine, not about this repo)")
@@ -278,7 +279,32 @@ def resolve_project(args) -> str:
         if args.project:
             raise SystemExit("Error: pass --scope user or --project, not both")
         return USER_PROJECT
+    if args.project and is_reserved_id(args.project):
+        raise SystemExit(
+            f'Error: project ids that start with "_" are reserved ("{args.project}"); '
+            "use --scope user for the user scope")
     return args.project or default_project()
+
+
+def is_reserved_id(pid: str) -> bool:
+    """Reserved ids start with "_". The daemon lists _user among the
+    projects, but for scripts it is --scope user, never --project."""
+    return pid.startswith("_")
+
+
+def home_slug_name() -> str:
+    """The project id the home directory would derive. It names the user,
+    not a project, so writes never accept it."""
+    return slug_name(Path.home().name)
+
+
+def list_projects_visible() -> dict:
+    """The daemon's project list without reserved ids."""
+    out = fetch("GET", "/projects")
+    if isinstance(out, dict):
+        out = dict(out)
+        out["projects"] = [p for p in (out.get("projects") or []) if not is_reserved_id(p["id"])]
+    return out
 
 
 def add_write_args(ap) -> None:
@@ -343,11 +369,18 @@ def check_write_target(args, project: str) -> None:
     default project for writes. Same rule as the TS proxy; the memstate CLI
     is the human escape for a deliberate near-duplicate. Exits 1 with the
     way out on stderr; a refusal creates nothing."""
+    if args.new_project and args.scope == "user":
+        raise SystemExit(
+            "Error: --new-project has no effect with --scope user: the user scope always exists")
     if args.scope == "user":
         return
     explicit = bool(args.project)
     if not explicit:
         if in_git_repo():
+            if args.new_project:
+                raise SystemExit(
+                    "Error: --new-project has no effect here: the project of the git "
+                    f'repository you are in ("{project}") is created without it')
             return
         if is_home_dir():
             raise SystemExit(
@@ -355,6 +388,10 @@ def check_write_target(args, project: str) -> None:
                 "default project for writes. Pass --project ID (an id from "
                 "memstate_get.py --list-projects, or a new id with --new-project), "
                 "or --scope user for facts about this machine")
+    if explicit and project == home_slug_name():
+        raise SystemExit(
+            f'Error: "{project}" is the name of your home directory, which names the user, '
+            "not a project; pass another --project, or --scope user for facts about this machine")
     ids = list_project_ids()
     if project in ids:
         return
