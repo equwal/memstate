@@ -568,6 +568,85 @@ async function main() {
         JSON.stringify(f));
     });
 
+    // ---- project creation gate ------------------------------------------------
+    // Outside a git repository the directory name is not a project. A write
+    // to the cwd default is refused until that project exists, unless the
+    // call carries new_project=true. Reads, explicit project_id and a pinned
+    // session are free. The home directory never gets a default for writes.
+    const gateCwd = path.join(tmp, "gate_dir");
+    fs.mkdirSync(gateCwd);
+    await withProxy(env, gateCwd, async (g) => {
+      let f = await call(g, "memstate_get", {});
+      check("gate: a read from a non-repo dir with no project is free",
+        !f.isError && f.data.project_id === "gate_dir" && f.data.total_memories === 0,
+        JSON.stringify(f));
+      f = await call(g, "memstate_set", { keypath: "notes.a", value: "v" });
+      check("gate: a write that would create the cwd project is refused",
+        f.isError && f.message.includes("new_project") && f.message.includes('"gate_dir"'),
+        JSON.stringify(f));
+      f = await call(g, "memstate_remember", { content: "## Notes\nbody\n" });
+      check("gate: remember is gated like set",
+        f.isError && f.message.includes("new_project"),
+        JSON.stringify(f));
+      f = await call(g, "memstate_set", { project_id: PROJECT, keypath: "config.delta", value: "explicit" });
+      check("gate: explicit project_id bypasses the gate",
+        !f.isError && f.data.stored.project_id === PROJECT,
+        JSON.stringify(f));
+      f = await call(g, "memstate_set", { keypath: "notes.a", value: "v", new_project: true });
+      check("gate: new_project=true creates the cwd project",
+        !f.isError && f.data.stored.project_id === "gate_dir",
+        JSON.stringify(f));
+      f = await call(g, "memstate_set", { keypath: "notes.b", value: "w" });
+      check("gate: once the project exists, writes need no flag",
+        !f.isError && f.data.stored.project_id === "gate_dir",
+        JSON.stringify(f));
+    });
+    // The cwd basename resembles an existing project: refused, the existing
+    // id named, and new_project does not override that.
+    const nearCwd = path.join(tmp, "regress_tests");
+    fs.mkdirSync(nearCwd);
+    await withProxy(env, nearCwd, async (n) => {
+      let f = await call(n, "memstate_set", { keypath: "notes.a", value: "v", new_project: true });
+      check("gate: a cwd that looks like an existing project is refused",
+        f.isError && f.message.includes(`"${PROJECT}"`) && f.message.includes("project_name"),
+        JSON.stringify(f));
+      f = await call(n, "memstate_set", { project_name: PROJECT, keypath: "notes.near", value: "pinned" });
+      check("gate: pinning the existing project is the way out",
+        !f.isError && f.data.stored.project_id === PROJECT && f.data.session_project === PROJECT,
+        JSON.stringify(f));
+    });
+    // Skipped when the home directory itself is a git repository.
+    let homeIsRepo = true;
+    try {
+      execFileSync("git", ["-C", os.homedir(), "rev-parse", "--show-toplevel"], { stdio: "ignore" });
+    } catch {
+      homeIsRepo = false;
+    }
+    if (!homeIsRepo) {
+      await withProxy(env, os.homedir(), async (h) => {
+        let f = await call(h, "memstate_set", { keypath: "notes.a", value: "v", new_project: true });
+        check("gate: a write from the home directory is refused even with new_project",
+          f.isError && f.message.includes("home directory") && f.message.includes("project_name") &&
+            f.message.includes('scope="user"'),
+          JSON.stringify(f));
+        f = await call(h, "memstate_set", { scope: "user", keypath: "preferences.gate", value: "v" });
+        check("gate: the user scope is open from the home directory",
+          !f.isError && f.data.stored.project_id === "_user",
+          JSON.stringify(f));
+        f = await call(h, "memstate_set", { project_name: "other_proj", keypath: "notes.home", value: "v" });
+        check("gate: a pin from the home directory writes to the pinned project",
+          !f.isError && f.data.stored.project_id === "other_proj" && f.data.session_project === "other_proj",
+          JSON.stringify(f));
+      });
+    }
+    const after = await call(client, "memstate_get", { list_projects: true });
+    const afterIds = after.data.projects.map((p) => p.id);
+    const homeId = path.basename(os.homedir()).toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+    check("gate: refused writes created no project",
+      afterIds.includes("gate_dir") && !afterIds.includes("regress_tests") &&
+        (homeIsRepo || !afterIds.includes(homeId)),
+      afterIds.join(","));
+
     // ---- error path -----------------------------------------------------------
     const bad = await client.callTool({ name: "memstate_set", arguments: {} });
     check("set: missing required fields is an error",
@@ -594,6 +673,9 @@ async function main() {
       check("recall: finds the shared daemon via daemon.addr and injects a hit",
         first.includes(`<memstate-recall project="${PROJECT}">`) &&
           first.includes("### decisions"),
+        JSON.stringify(first));
+      check("recall: the scope block says whether the cwd project exists",
+        first.includes(`<memstate-scope cwd_project="${PROJECT}" exists="true">`),
         JSON.stringify(first));
       check("recall: same session does not repeat a keypath",
         recall("regress_s1") === "",

@@ -129,8 +129,14 @@ about another subject (for example "set up my nginx config" from the home
 directory), the agent pins its session once with `project_name` on the
 first tool call. An existing id pins freely. A new id also needs
 `new_project=true` and is refused when it looks like an existing id
-(`regress_tests` vs `regress_test`). One pin per session. These scripts
-are one-shot and have no session: pass `--project` instead.
+(`regress_tests` vs `regress_test`). One pin per session.
+
+Outside a git repository the directory name is only a guess, so the proxy
+refuses a write that would create the cwd default project unless the call
+carries `new_project=true`, and refuses it outright when the name resembles
+an existing project. The home directory has no default project for writes:
+the agent pins a project or uses the user scope. These scripts are one-shot
+and have no session: pass `--project` instead; nothing is gated here.
 
 ## Workflows
 

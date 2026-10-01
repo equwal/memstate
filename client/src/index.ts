@@ -88,8 +88,9 @@ let managedChild: ChildProcess | null = null;
 // repo name (or the working directory's basename outside a repo), slugged
 // to lowercase snake_case. MCP clients spawn this proxy in the project
 // directory, so this pins one stable id per repo and stops callers from
-// inventing near-duplicate ids.
-function deriveProjectId(): string {
+// inventing near-duplicate ids. Outside a repository the id is a guess,
+// which checkDefaultWrite gates; inRepo records which case this is.
+function deriveProjectId(): { id: string; inRepo: boolean } {
   let base = "";
   try {
     const top = execSync("git rev-parse --show-toplevel", {
@@ -101,8 +102,9 @@ function deriveProjectId(): string {
   } catch {
     /* not a git repo */
   }
+  const inRepo = base !== "";
   if (!base) base = path.basename(process.cwd());
-  return slugName(base);
+  return { id: slugName(base), inRepo };
 }
 
 // slugName is the shared id rule: lowercase, runs of other characters
@@ -116,7 +118,10 @@ function slugName(name: string): string {
   return slug || "default";
 }
 
-const DEFAULT_PROJECT = deriveProjectId();
+const { id: DEFAULT_PROJECT, inRepo: CWD_IN_REPO } = deriveProjectId();
+// The home directory names the user, not a project: no write lands in its
+// default project (see checkDefaultWrite).
+const CWD_IS_HOME = path.resolve(process.cwd()) === path.resolve(os.homedir());
 
 // USER_PROJECT is the daemon's one reserved project for facts about the
 // user and the host. The daemon rejects writes there outside a short
@@ -167,8 +172,10 @@ const NEW_PROJECT_PROP = {
   type: "boolean",
   default: false,
   description:
-    "With project_name only: allow a project id that does not exist yet. " +
-    "Refused when the id looks like a misspelling of an existing project.",
+    "With project_name: allow a project id that does not exist yet. " +
+    "Without project_name, on a write outside a git repository: allow this " +
+    "call to create the cwd default project. Either way the id is refused " +
+    "when it looks like a misspelling of an existing project.",
 };
 
 let sessionProject = "";
@@ -260,10 +267,55 @@ async function pinSession(a: ToolArgs): Promise<void> {
   sessionProject = name;
 }
 
+// defaultProjectExists caches a positive /projects answer: once the cwd
+// default project is known to exist, writes to it need no further check.
+let defaultProjectExists = false;
+
+// checkDefaultWrite gates a write to the cwd default project. Inside a git
+// repository the repository name is intent, so nothing is checked. Outside
+// one the directory name is a guess: the project must exist already, or the
+// call must carry new_project=true, and the id must not resemble an existing
+// project. The home directory names the user, so it never gets a default
+// project for writes. Refusals create nothing.
+async function checkDefaultWrite(a: ToolArgs): Promise<void> {
+  if (CWD_IN_REPO || defaultProjectExists) return;
+  if (CWD_IS_HOME) {
+    throw new Error(
+      "the working directory is your home directory, which has no default " +
+        "project for writes. Pin a project with project_name (an id from " +
+        "memstate_get(list_projects=true), or a new id with new_project=true), " +
+        'or use scope="user" for facts about this machine'
+    );
+  }
+  const ids = await listProjectIds();
+  if (ids.includes(DEFAULT_PROJECT)) {
+    defaultProjectExists = true;
+    return;
+  }
+  const near = nearDuplicates(DEFAULT_PROJECT, ids);
+  if (near.length > 0) {
+    throw new Error(
+      `the working directory is not a git repository, and its project "${DEFAULT_PROJECT}" ` +
+        `does not exist but looks like existing project ${near.map((id) => `"${id}"`).join(", ")}; ` +
+        `pin the session with project_name="${near[0]}", or pass project_id for a truly different project`
+    );
+  }
+  if (a.new_project !== true) {
+    throw new Error(
+      `the working directory is not a git repository and no project "${DEFAULT_PROJECT}" exists. ` +
+        "Pass project_name=<an id from memstate_get(list_projects=true)> to use another project, " +
+        `new_project=true to create "${DEFAULT_PROJECT}", or scope="user" for facts about this machine`
+    );
+  }
+  // Allowed. The next write without the flag asks /projects again and
+  // finds the project, so a failed create never marks it as existing.
+}
+
 // resolveProject picks the project id for a call: the reserved user
 // project for scope "user", else the explicit id, else the session pin,
-// else this repo's.
-async function resolveProject(a: ToolArgs): Promise<string> {
+// else this directory's. A write that lands on the directory default
+// passes checkDefaultWrite first.
+async function resolveProject(a: ToolArgs, write = false): Promise<string> {
   if (a.project_name !== undefined) {
     await pinSession(a);
   }
@@ -276,7 +328,10 @@ async function resolveProject(a: ToolArgs): Promise<string> {
   if (a.scope !== undefined && a.scope !== "project") {
     throw new Error(`unknown scope ${JSON.stringify(a.scope)}; use "project" or "user"`);
   }
-  return String(a.project_id || sessionProject || DEFAULT_PROJECT);
+  if (a.project_id) return String(a.project_id);
+  if (sessionProject) return sessionProject;
+  if (write) await checkDefaultWrite(a);
+  return DEFAULT_PROJECT;
 }
 
 // stripProxyFields removes the fields only the proxy understands before a
@@ -711,7 +766,7 @@ const TOOLS: ToolDef[] = [
     },
     handler: async (a) =>
       postJSON("/memories/store", {
-        project_id: await resolveProject(a),
+        project_id: await resolveProject(a, true),
         keypath: a.keypath,
         content: a.value,
         source: a.source,
@@ -785,7 +840,7 @@ const TOOLS: ToolDef[] = [
     handler: async (a) =>
       postJSON("/memories/remember", {
         ...stripProxyFields(a),
-        project_id: await resolveProject(a),
+        project_id: await resolveProject(a, true),
       }),
   },
   {
@@ -1030,6 +1085,14 @@ const TOOLS: ToolDef[] = [
   },
 ];
 
+// DEFAULT_ORIGIN tells the model where its default project id came from
+// and, outside a repository, that writes to it are gated.
+const DEFAULT_ORIGIN = CWD_IN_REPO
+  ? "derived from the git repository name"
+  : CWD_IS_HOME
+    ? "derived from the home directory, which has no default project for writes; see Session project"
+    : "derived from the directory name, which is not a git repository; see Session project";
+
 const INSTRUCTIONS = `memstate — persistent memory across sessions, scoped per project.
 
 When to use:
@@ -1048,7 +1111,7 @@ and returns it to you, so you see what changed. Deletes keep history.
 
 Conventions — follow these EXACTLY; every deviation fragments the store:
 - project_id: OMIT it. This session's default is "${DEFAULT_PROJECT}"
-  (derived from the repo/directory name) and is used whenever project_id
+  (${DEFAULT_ORIGIN}) and is used whenever project_id
   is absent. Only pass project_id to reach a DIFFERENT project, and then
   only an id that memstate_get(list_projects=true) actually lists — NEVER
   invent a variant: "my-app", "myapp", and "my_app_dev" each create a
@@ -1110,7 +1173,15 @@ Session project — when the prompt is not about this directory:
   id ("regress_tests" vs "regress_test", "my_app_dev" vs "my_app"). Never
   invent a variant of an existing name.
 - One pin per session; a different project_name later is an error. Pass
-  project_id to reach another project for one call.`;
+  project_id to reach another project for one call.
+- Outside a git repository the directory name is not a project. A write
+  (memstate_set, memstate_remember) to the cwd default is refused until
+  that project exists: pin an existing project with project_name, or pass
+  new_project=true once to create "${DEFAULT_PROJECT}" when nothing fits.
+  A directory name that resembles an existing project is refused; pin the
+  existing project instead. Reads and explicit project_id are free.
+- The home directory has no default project for writes at all: pin with
+  project_name, or use scope="user" for facts about this machine.`;
 
 // ---------- main ----------
 

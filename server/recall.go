@@ -97,7 +97,11 @@ func runRecall(stdin io.Reader, stdout io.Writer) int {
 			debug("all-projects search: %v", err)
 			all = nil
 		}
-		out.WriteString(scopeBlock(project, ev.Cwd, projectCandidates(all, project)))
+		exists, err := recallProjectExists(addr, project)
+		if err != nil {
+			debug("projects: %v", err)
+		}
+		out.WriteString(scopeBlock(project, ev.Cwd, exists, projectCandidates(all, project)))
 		shown = append(shown, scopeMarker)
 	}
 
@@ -209,15 +213,23 @@ func projectCandidates(hits []recallHit, cwdProject string) []projectCandidate {
 // the other projects the prompt matches, and the rule for overriding. The
 // cwd stays the default; the model overrides only on clear evidence, and a
 // new name is a deliberate second step (new_project=true in the proxy).
-func scopeBlock(project, cwd string, cands []projectCandidate) string {
+func scopeBlock(project, cwd string, exists bool, cands []projectCandidate) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "<memstate-scope cwd_project=%q>\n", project)
+	fmt.Fprintf(&b, "<memstate-scope cwd_project=%q exists=\"%t\">\n", project, exists)
 	if root, ok := repoRoot(cwd); ok {
 		fmt.Fprintf(&b, "The working directory is the git repository %s.\n", filepath.Base(root))
 	} else if home, err := os.UserHomeDir(); err == nil && filepath.Clean(cwd) == filepath.Clean(home) {
-		b.WriteString("The working directory is not a git repository (home directory).\n")
+		// The home directory names the user, not a project. The proxy
+		// refuses writes to its default there; say so before the first write.
+		b.WriteString("The working directory is not a git repository (home directory). " +
+			"There is no default project for writes here: pin one with project_name, " +
+			"or use scope=\"user\" for facts about this machine.\n")
 	} else {
-		fmt.Fprintf(&b, "The working directory is not a git repository (%s).\n", filepath.Base(cwd))
+		fmt.Fprintf(&b, "The working directory is not a git repository (%s).", filepath.Base(cwd))
+		if !exists {
+			fmt.Fprintf(&b, " Project %q does not exist yet; a write creates it only with new_project=true.", project)
+		}
+		b.WriteString("\n")
 	}
 	if len(cands) == 0 {
 		b.WriteString("Prompt matches no other project.\n")
@@ -251,6 +263,34 @@ func slugProject(name string) string {
 // recallSearch runs a hybrid search on the daemon at addr. Any non-200
 // reply is an error, including "unknown mode" from a daemon that predates
 // hybrid search.
+// recallProjectExists reports whether the daemon lists project as live.
+func recallProjectExists(addr, project string) (bool, error) {
+	client := &http.Client{Timeout: recallTimeout}
+	resp, err := client.Get("http://" + addr + "/api/v1/projects")
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return false, fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(msg)))
+	}
+	var out struct {
+		Projects []struct {
+			ID string `json:"id"`
+		} `json:"projects"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return false, err
+	}
+	for _, p := range out.Projects {
+		if p.ID == project {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func recallSearch(addr, project, prompt string) ([]recallHit, error) {
 	req := map[string]any{
 		"query": prompt,

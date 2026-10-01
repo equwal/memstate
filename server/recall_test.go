@@ -319,22 +319,34 @@ func TestProjectCandidates(t *testing.T) {
 
 func TestScopeBlockText(t *testing.T) {
 	plain := t.TempDir()
-	text := scopeBlock("scratch", plain, nil)
-	if !strings.HasPrefix(text, "<memstate-scope cwd_project=\"scratch\">\n") ||
+	text := scopeBlock("scratch", plain, false, nil)
+	if !strings.HasPrefix(text, "<memstate-scope cwd_project=\"scratch\" exists=\"false\">\n") ||
 		!strings.Contains(text, "is not a git repository ("+filepath.Base(plain)+")") ||
+		!strings.Contains(text, `Project "scratch" does not exist yet; a write creates it only with new_project=true.`) ||
 		!strings.Contains(text, "matches no other project") ||
-		!strings.Contains(text, "new_project=true") ||
 		!strings.HasSuffix(text, "</memstate-scope>\n") {
 		t.Fatalf("plain dir block:\n%s", text)
 	}
-	home, err := os.UserHomeDir()
-	if err == nil {
-		if got := scopeBlock("me", home, nil); !strings.Contains(got, "(home directory)") {
-			t.Fatalf("home block:\n%s", got)
+	// An existing project gets the attribute and no creation sentence.
+	text = scopeBlock("scratch", plain, true, nil)
+	if !strings.HasPrefix(text, "<memstate-scope cwd_project=\"scratch\" exists=\"true\">\n") ||
+		strings.Contains(text, "does not exist yet") {
+		t.Fatalf("existing project block:\n%s", text)
+	}
+	// The home directory never has a default project for writes. Skipped
+	// when the home directory itself is a git repository.
+	if home, err := os.UserHomeDir(); err == nil {
+		if _, isRepo := repoRoot(home); !isRepo {
+			got := scopeBlock("me", home, true, nil)
+			if !strings.Contains(got, "(home directory)") ||
+				!strings.Contains(got, "no default project for writes") ||
+				!strings.Contains(got, `scope="user"`) {
+				t.Fatalf("home block:\n%s", got)
+			}
 		}
 	}
 	cands := []projectCandidate{{"nginx_server", 3}, {"infra", 2}, {"one", 1}}
-	text = scopeBlock("me", plain, cands)
+	text = scopeBlock("me", plain, true, cands)
 	if !strings.Contains(text, "Prompt matches other projects: nginx_server (3 semantic hits), infra (2 semantic hits), one (1 semantic hit).") {
 		t.Fatalf("candidates line:\n%s", text)
 	}
@@ -346,7 +358,7 @@ func TestScopeBlockText(t *testing.T) {
 	if out, err := exec.Command("git", "-C", repo, "init", "-q").CombinedOutput(); err != nil {
 		t.Skipf("git init unavailable: %v %s", err, out)
 	}
-	if got := scopeBlock("repo_name", repo, nil); !strings.Contains(got, "is the git repository Repo.Name.") {
+	if got := scopeBlock("repo_name", repo, true, nil); !strings.Contains(got, "is the git repository Repo.Name.") {
 		t.Fatalf("repo block:\n%s", got)
 	}
 }
@@ -388,7 +400,7 @@ func TestScopeBlockFirstPromptOnly(t *testing.T) {
 	// No embedder here: every hit is an FTS word match, so no project
 	// qualifies as a candidate, however many words it shares.
 	first := run("sc1", "help me set up my nginx config")
-	if !strings.Contains(first, `<memstate-scope cwd_project="scratch">`) ||
+	if !strings.Contains(first, `<memstate-scope cwd_project="scratch" exists="true">`) ||
 		!strings.Contains(first, "Prompt matches no other project.") ||
 		strings.Contains(first, "nginx_server (") ||
 		!strings.Contains(first, `<memstate-recall project="scratch">`) {
@@ -416,7 +428,7 @@ func TestScopeBlockFirstPromptOnly(t *testing.T) {
 	var out bytes.Buffer
 	event := `{"session_id":"sc3","cwd":` + jsonString(empty) + `,"prompt":"help me set up my nginx config"}`
 	runRecall(strings.NewReader(event), &out)
-	if !strings.Contains(out.String(), `<memstate-scope cwd_project="nothing_here">`) ||
+	if !strings.Contains(out.String(), `<memstate-scope cwd_project="nothing_here" exists="false">`) ||
 		strings.Contains(out.String(), "<memstate-recall") {
 		t.Fatalf("empty project first prompt:\n%s", out.String())
 	}
