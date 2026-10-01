@@ -64,6 +64,14 @@ test, and the MCP regression suite (`client/test/regression.mjs`), which
 calls each tool through the real proxy and daemon against a temporary
 database.
 
+On Windows the same `make` targets run from cmd.exe or PowerShell with
+GNU make (for example `choco install make`), Go, Node and Python on PATH;
+no bash and no coreutils are needed. The build produces `memstated.exe`,
+and `make install` copies it to GOBIN as `memstated.exe` and
+`memstate.exe` instead of a symlink. Git Bash and WSL work too. The hook
+scripts that `make install-skill` copies are bash scripts and need Git
+Bash to run.
+
 ### Daemon only, without Go
 
 To get only `memstated` as a prebuilt binary (Linux or macOS, amd64 or

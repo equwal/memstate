@@ -44,7 +44,8 @@ def _resolve_bin() -> str:
     if explicit and Path(explicit).exists():
         return explicit
     # scripts/ → client/skill/scripts/ → ../../../server/memstated
-    sibling = (Path(__file__).resolve().parent / ".." / ".." / ".." / "server" / "memstated").resolve()
+    binary = "memstated.exe" if os.name == "nt" else "memstated"
+    sibling = (Path(__file__).resolve().parent / ".." / ".." / ".." / "server" / binary).resolve()
     if sibling.exists():
         return str(sibling)
     return "memstated"  # fall through to PATH

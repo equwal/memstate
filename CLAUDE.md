@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Build & test
 
-Two-process project: Go daemon under `server/`, TypeScript MCP proxy under `client/`. Requires Go 1.27+ and Node 18+.
+Two-process project: Go daemon under `server/`, TypeScript MCP proxy under `client/`. Requires Go 1.27+ and Node 18+. The Makefile also runs on native Windows under GNU make: `OS=Windows_NT` selects `.exe` and `python`, and without `MSYSTEM` (Git Bash) the recipes run in `cmd.exe` through the macro block at the top (`RM_RF`, `CP_FILE`, `SAY`, `XBUILD`, …). Targets never call a shell command directly, so a new recipe must use those macros; the three sibling-binary lookups (`resolveDaemonBin`, the regression suite's `DAEMON`, `_client._resolve_bin`) add `.exe` on Windows.
 
 The Makefile at the repo root is the canonical entrypoint:
 

@@ -382,7 +382,8 @@ function resolveDaemonBin(): string {
   if (process.env.MEMSTATE_BIN && fs.existsSync(process.env.MEMSTATE_BIN)) {
     return process.env.MEMSTATE_BIN;
   }
-  const sibling = path.resolve(__dirname, "..", "..", "server", "memstated");
+  const exe = process.platform === "win32" ? ".exe" : "";
+  const sibling = path.resolve(__dirname, "..", "..", "server", "memstated" + exe);
   if (fs.existsSync(sibling)) return sibling;
   return "memstated"; // fall through to PATH
 }

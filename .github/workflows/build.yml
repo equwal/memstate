@@ -29,6 +29,40 @@ jobs:
           name: memstated-binaries
           path: dist/*
 
+  # The Makefile must work without bash: this job runs its cmd.exe recipes
+  # on a native Windows runner. `make test` is not run here yet.
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: server/go.mod
+          cache-dependency-path: server/go.sum
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install GNU make
+        run: choco install make --no-progress -y
+
+      - name: make build
+        run: make build
+
+      - name: make install
+        run: make install
+
+      - name: make uninstall
+        run: make uninstall
+
+      - name: make release
+        run: make release
+
+      - name: make clean
+        run: make clean
+
   # Tag pushes (vX.Y.Z) additionally publish a GitHub Release whose assets
   # are the raw platform binaries — `memstated upgrade` fetches them by name.
   release:

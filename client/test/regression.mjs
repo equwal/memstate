@@ -34,7 +34,8 @@ const PROJECT = "regress_test";
 const DENIED_RULE = "Never save a denied prompt";
 const DAEMON =
   process.env.MEMSTATE_BIN ||
-  path.resolve(__dirname, "..", "..", "server", "memstated");
+  path.resolve(__dirname, "..", "..", "server",
+    "memstated" + (process.platform === "win32" ? ".exe" : ""));
 
 let failures = 0;
 function check(name, cond, detail = "") {
