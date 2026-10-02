@@ -63,6 +63,107 @@ jobs:
       - name: make clean
         run: make clean
 
+  # The install scripts run against the assets of this build. A local HTTP
+  # server holds the `make release` output, and HOME (USERPROFILE and
+  # LOCALAPPDATA on Windows) is a scratch directory. Each script runs twice
+  # in its documented form (curl | bash, irm | iex): the second run must
+  # leave the same state.
+  install-scripts:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: memstated-binaries
+          path: dist
+
+      - name: install.sh
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m http.server 8000 --bind 127.0.0.1 --directory dist >/dev/null 2>&1 &
+          server=$!
+          trap 'kill $server' EXIT
+          for _ in $(seq 50); do curl -fsS -o /dev/null http://127.0.0.1:8000/ && break; sleep 0.2; done
+          export HOME="$RUNNER_TEMP/home"
+          mkdir -p "$HOME/.claude"
+          unset XDG_DATA_HOME MEMSTATE_ADDR
+          export MEMSTATE_DOWNLOAD_URL=http://127.0.0.1:8000 MEMSTATE_SETUP=0 MEMSTATE_INSTALL_SKILL=1
+          cat install.sh | bash
+          cat install.sh | bash
+          export PATH="$HOME/.local/bin:$PATH"
+          memstated --help >/dev/null 2>&1
+          memstate --help >/dev/null 2>&1
+          MEMSTATE_DB="$RUNNER_TEMP/smoke/memstate.db" MEMSTATE_NO_UPDATE_CHECK=1 memstate-mcp --test
+          test -f "$HOME/.claude/skills/memstate/SKILL.md"
+          python3 - bash <<'EOF'
+          import json, os, subprocess, sys
+          settings = json.load(open(os.path.join(os.path.expanduser("~"), ".claude", "settings.json")))
+          commands = [h["command"] for e in settings["hooks"]["UserPromptSubmit"] for h in e["hooks"]]
+          assert len(commands) == 2, commands
+          for command in commands:
+              subprocess.run([sys.argv[1], "-c", command], input=b"{}", check=True)
+          print("hooks ok:", commands)
+          EOF
+
+      # Windows PowerShell 5.1 is the shell that `irm | iex` usually runs in.
+      - name: install.ps1
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $server = Start-Process python -ArgumentList '-m', 'http.server', '8000', '--bind', '127.0.0.1', '--directory', 'dist' -NoNewWindow -PassThru
+          try {
+            foreach ($i in 1..50) {
+              try { Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8000/ | Out-Null; break } catch { Start-Sleep -Milliseconds 200 }
+            }
+            $env:USERPROFILE = Join-Path $env:RUNNER_TEMP 'home'
+            $env:LOCALAPPDATA = Join-Path $env:RUNNER_TEMP 'localappdata'
+            New-Item -ItemType Directory -Force (Join-Path $env:USERPROFILE '.claude'), $env:LOCALAPPDATA | Out-Null
+            Remove-Item Env:MEMSTATE_ADDR -ErrorAction SilentlyContinue
+            $env:MEMSTATE_DOWNLOAD_URL = 'http://127.0.0.1:8000'
+            $env:MEMSTATE_SETUP = '0'
+            $env:MEMSTATE_INSTALL_SKILL = '1'
+            Get-Content -Raw install.ps1 | Invoke-Expression
+            Get-Content -Raw install.ps1 | Invoke-Expression
+          } finally {
+            Stop-Process -Id $server.Id -ErrorAction SilentlyContinue
+          }
+          $serverDir = Join-Path $env:LOCALAPPDATA 'Programs\memstate\server'
+          $userPath = (Get-Item 'HKCU:\Environment').GetValue('Path', '', 'DoNotExpandEnvironmentNames')
+          if (@($userPath -split ';') -notcontains $serverDir) { throw "the user PATH does not have $serverDir" }
+          $env:Path = "$serverDir;$env:Path"
+          cmd /c "memstated --help >NUL 2>&1"
+          if ($LASTEXITCODE -ne 0) { throw 'memstated --help failed' }
+          cmd /c "memstate --help >NUL 2>&1"
+          if ($LASTEXITCODE -ne 0) { throw 'memstate --help failed' }
+          $env:MEMSTATE_DB = Join-Path $env:RUNNER_TEMP 'smoke\memstate.db'
+          $env:MEMSTATE_NO_UPDATE_CHECK = '1'
+          cmd /c "memstate-mcp --test 2>&1"
+          if ($LASTEXITCODE -ne 0) { throw 'memstate-mcp --test failed' }
+          if (-not (Test-Path (Join-Path $env:USERPROFILE '.claude\skills\memstate\SKILL.md'))) { throw 'SKILL.md is missing' }
+          @'
+          import json, os, subprocess, sys
+          settings = json.load(open(os.path.join(os.path.expanduser("~"), ".claude", "settings.json")))
+          commands = [h["command"] for e in settings["hooks"]["UserPromptSubmit"] for h in e["hooks"]]
+          assert len(commands) == 2, commands
+          for command in commands:
+              subprocess.run([sys.argv[1], "-c", command], input=b"{}", check=True)
+          print("hooks ok:", commands)
+          '@ | python - 'C:\Program Files\Git\bin\bash.exe'
+          if ($LASTEXITCODE -ne 0) { throw 'the hook check failed' }
+
   # Tag pushes (vX.Y.Z) additionally publish a GitHub Release whose assets
   # are the raw platform binaries — `memstated upgrade` fetches them by name.
   release:
@@ -78,6 +179,11 @@ jobs:
         with:
           go-version-file: server/go.mod
           cache-dependency-path: server/go.sum
+
+      # `make release` builds the proxy bundle with npm.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
 
       - name: Check tag matches healthVersion
         run: |

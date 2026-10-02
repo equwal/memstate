@@ -11,8 +11,120 @@ your agent starts and stops when your agent stops.
 
 ## Install
 
-You need Go 1.27+ and Node 18+. Semantic search also needs a local
-[Ollama](https://ollama.com) with an embedding model pulled:
+### Install script
+
+You need Node 18 or later. The script checks for it before it downloads
+anything.
+
+macOS or Linux (amd64 or arm64):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/map588/memstate/main/install.sh | bash
+```
+
+Windows 10 1803 or later (amd64, or arm64 through x64 emulation), in
+PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/map588/memstate/main/install.ps1 | iex
+```
+
+The script does these steps:
+
+1. It downloads the newest [release](https://github.com/map588/memstate/releases):
+   the `memstated` daemon for your platform and `memstate-mcp.tar.gz`,
+   which holds the MCP proxy and its Node packages.
+2. It installs both. Then it starts the proxy once with a scratch
+   database, to make sure that the proxy finds the daemon.
+3. In a terminal, it runs `memstate-mcp setup`. Setup finds Claude Code,
+   Claude Desktop, Cursor and Windsurf, asks for the embedding model, and
+   asks before it changes a config.
+4. It asks whether to install the Claude Code skill and hooks (see
+   below).
+
+Where the files go:
+
+| | macOS, Linux | Windows |
+|---|---|---|
+| Programs | `~/.local/share/memstate/` (`$XDG_DATA_HOME/memstate` when set) | `%LOCALAPPDATA%\Programs\memstate\` |
+| Commands | links in `~/.local/bin`: `memstated`, `memstate`, `memstate-mcp` | the `server\` directory of the programs, added to your user PATH |
+
+The proxy finds the daemon next to it, in `server/`, so the MCP config
+does not depend on PATH. Your memories stay in `~/.memstate/`.
+
+Set these environment variables to change what the script does:
+
+- `MEMSTATE_VERSION=v0.7.8` installs that release, not the newest one.
+- `MEMSTATE_INSTALL_DIR` changes the directory for the links (macOS, Linux).
+- `MEMSTATE_SETUP=0` or `1` skips or runs `memstate-mcp setup` with no prompt.
+- `MEMSTATE_INSTALL_SKILL=0` or `1` skips or installs the skill with no prompt.
+
+For example:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/map588/memstate/main/install.sh | MEMSTATE_INSTALL_SKILL=1 bash
+```
+
+```powershell
+$env:MEMSTATE_INSTALL_SKILL = '1'; irm https://raw.githubusercontent.com/map588/memstate/main/install.ps1 | iex
+```
+
+To update, run the script again. It replaces the daemon and the proxy
+together. `memstated upgrade` replaces only the daemon.
+
+To uninstall on macOS or Linux:
+
+```bash
+python3 ~/.local/share/memstate/configure-claude-hook.py uninstall   # removes the hooks from settings.json
+rm -rf ~/.local/share/memstate ~/.claude/skills/memstate ~/.claude/hooks/memstate-*.sh
+rm -f ~/.local/bin/memstated ~/.local/bin/memstate ~/.local/bin/memstate-mcp
+claude mcp remove memstate --scope user
+```
+
+To uninstall on Windows:
+
+```powershell
+python "$env:LOCALAPPDATA\Programs\memstate\configure-claude-hook.py" uninstall
+Remove-Item -Recurse -Force "$env:LOCALAPPDATA\Programs\memstate", "$HOME\.claude\skills\memstate", "$HOME\.claude\hooks\memstate-*.sh"
+claude mcp remove memstate --scope user
+```
+
+Then remove `%LOCALAPPDATA%\Programs\memstate\server` from your user PATH.
+Remove the `memstate` entry from the config of each other MCP client.
+
+### Build from source
+
+You need Go 1.27+ and Node 18+.
+
+```bash
+git clone git@github.com:map588/memstate.git
+cd memstate
+make install
+```
+
+This puts two programs on your PATH:
+
+- `memstated`: the Go daemon. It installs to `$(go env GOPATH)/bin`, or to `$GOBIN` when set.
+- `memstate-mcp`: the MCP stdio proxy, linked from `client/` with `npm link`.
+
+`make uninstall` removes both. `make build` compiles in place and does
+not touch PATH. `make test` runs the Go tests, the end-to-end smoke
+test, and the MCP regression suite (`client/test/regression.mjs`), which
+calls each tool through the real proxy and daemon against a temporary
+database.
+
+On Windows the same `make` targets run from cmd.exe or PowerShell with
+GNU make (for example `choco install make`), Go, Node and Python on PATH;
+no bash and no coreutils are needed. The build produces `memstated.exe`,
+and `make install` copies it to GOBIN as `memstated.exe` and
+`memstate.exe` instead of a symlink. Git Bash and WSL work too. The hook
+scripts that `make install-skill` copies are bash scripts and need Git
+Bash to run.
+
+### Embeddings (optional)
+
+Semantic search needs a local [Ollama](https://ollama.com) with an
+embedding model pulled:
 
 ```bash
 ollama pull nomic-embed-text
@@ -47,54 +159,12 @@ When the server rejects a long memory ("context length" from Ollama,
 "too large to process" from llama.cpp), the daemon halves the text and
 tries again.
 
-```bash
-git clone git@github.com:map588/memstate.git
-cd memstate
-make install
-```
-
-This puts two programs on your PATH:
-
-- `memstated`: the Go daemon. It installs to `$(go env GOPATH)/bin`, or to `$GOBIN` when set.
-- `memstate-mcp`: the MCP stdio proxy, linked from `client/` with `npm link`.
-
-`make uninstall` removes both. `make build` compiles in place and does
-not touch PATH. `make test` runs the Go tests, the end-to-end smoke
-test, and the MCP regression suite (`client/test/regression.mjs`), which
-calls each tool through the real proxy and daemon against a temporary
-database.
-
-On Windows the same `make` targets run from cmd.exe or PowerShell with
-GNU make (for example `choco install make`), Go, Node and Python on PATH;
-no bash and no coreutils are needed. The build produces `memstated.exe`,
-and `make install` copies it to GOBIN as `memstated.exe` and
-`memstate.exe` instead of a symlink. Git Bash and WSL work too. The hook
-scripts that `make install-skill` copies are bash scripts and need Git
-Bash to run.
-
-### Daemon only, without Go
-
-To get only `memstated` as a prebuilt binary (Linux or macOS, amd64 or
-arm64), run the install script. It downloads the newest
-[release](https://github.com/map588/memstate/releases) into
-`~/.local/bin`:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/map588/memstate/main/install.sh | bash
-```
-
-Set `MEMSTATE_VERSION=v0.7.0` to pin a release, or
-`MEMSTATE_INSTALL_DIR` to change the directory. Later,
-`memstated upgrade` replaces the binary with the newest release.
-
-The script does not install the MCP proxy. `memstate-mcp` needs Node
-and is built from this repository with `make install` or `make build`.
-
 ### Claude Code skill and hook (optional)
 
-If you use Claude Code, `make install-skill` installs the bundled
-skill under `~/.claude/skills/memstate/`. It also adds two
-UserPromptSubmit hooks:
+If you use Claude Code, the install script asks whether to install the
+bundled skill. From a clone, `make install-skill` installs it. The skill
+goes to `~/.claude/skills/memstate/`, and two UserPromptSubmit hooks are
+added:
 
 - `memstate-persist-reminder.sh` points you to `memstate_remember`
   after three or more file edits since your last persist.
@@ -106,11 +176,19 @@ UserPromptSubmit hooks:
   `~/.memstate/daemon.addr`. Without one the hook prints nothing.
   Set `MEMSTATE_NO_RECALL=1` to turn it off.
 
+The skill scripts need Python 3. The hooks are bash scripts. On Windows,
+Claude Code runs hooks with Git Bash, so the install script adds the
+hooks only when it finds Git Bash. The persist reminder also needs `jq`
+and does nothing without it.
+
 `make uninstall-skill` removes the skill and both hooks. The install
 is idempotent and safe to run again. It replaces existing memstate
 entries in `settings.json` and does not duplicate them.
 
 ## Connect memstate to your agent
+
+The install script runs `memstate-mcp setup`, which writes the config
+for you (with `node` and the full path of the proxy). To do it by hand:
 
 **Claude Code** (one command):
 
@@ -153,8 +231,10 @@ If you do not want to change PATH, skip `make install` and use
 ### Verify
 
 ```bash
-node client/dist/index.js --test
+memstate-mcp --test
 ```
+
+From a clone without `make install`, run `node client/dist/index.js --test`.
 
 Expected result: the proxy spawns a daemon, prints the daemon address
 and the seven tool names, and exits cleanly.

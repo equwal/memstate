@@ -320,7 +320,9 @@ export async function main(): Promise<void> {
     "\nDone.\n\n" +
       "Next steps:\n" +
       "  1. Restart your agent so it picks up the new MCP server.\n" +
-      "  2. Build the Go daemon: cd ../server && go build -o memstated .\n" +
+      "  2. The proxy starts memstated from MEMSTATE_BIN when it is set, else from ../server\n" +
+      "     next to the proxy (the install script and a repository build put it there),\n" +
+      "     else from PATH.\n" +
       "  3. First tool call auto-spawns the daemon; logs at memstated.log next to the DB (default ~/.memstate/memstated.log).\n" +
       (embedModel
         ? `  4. Semantic search uses ${embedModel}; run \`ollama pull ${embedModel}\` if needed.\n\n`
