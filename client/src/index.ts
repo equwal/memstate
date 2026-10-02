@@ -561,8 +561,10 @@ async function probeHealth(addr: string): Promise<HealthProbe> {
   }
 }
 
+// openDaemonLog opens the daemon log next to the DB, so a daemon on a test DB
+// does not write to the log of the user's daemon.
 function openDaemonLog(): { logFD: number | null; logPath: string } {
-  const logDir = path.join(process.env.HOME ?? "/tmp", ".memstate");
+  const logDir = memstateDir();
   try {
     fs.mkdirSync(logDir, { recursive: true });
   } catch {}

@@ -47,6 +47,12 @@ function check(name, cond, detail = "") {
   }
 }
 
+// readyLines counts the daemon start banners in a daemon log file.
+function readyLines(file) {
+  if (!fs.existsSync(file)) return 0;
+  return fs.readFileSync(file, "utf-8").split("\n").filter((l) => l.includes("MEMSTATE_READY")).length;
+}
+
 // call invokes one MCP tool and parses the JSON payload the proxy embeds in
 // content[0].text. Errors come back as { isError, message }.
 async function call(client, name, args) {
@@ -127,6 +133,13 @@ async function main() {
     check("set: first write is created v1",
       !r.isError && r.data.action === "created" && r.data.stored.version === 1,
       JSON.stringify(r));
+
+    // The proxy writes the daemon log next to MEMSTATE_DB. A test daemon on a
+    // temp DB must not write to the log of the user's daemon.
+    const daemonLog = path.join(tmp, "memstated.log");
+    check("log: the proxy writes the daemon log next to MEMSTATE_DB",
+      readyLines(daemonLog) > 0,
+      `no MEMSTATE_READY line in ${daemonLog}`);
 
     r = await call(client, "memstate_set", {
       project_id: PROJECT,
@@ -701,6 +714,7 @@ async function main() {
     };
     const pyCwd = path.join(tmp, "gate_py");
     fs.mkdirSync(pyCwd);
+    const readyBeforePy = readyLines(daemonLog);
     let p = py(pyCwd, ["--keypath", "notes.a", "--value", "v"]);
     check("gate (python): a write that would create the cwd project is refused",
       p.code !== 0 && p.err.includes("--new-project") && p.err.includes('"gate_py"'),
@@ -713,6 +727,9 @@ async function main() {
     check("gate (python): once the project exists, writes need no flag",
       p.code === 0,
       JSON.stringify(p));
+    check("log (python): the scripts write the daemon log next to MEMSTATE_DB",
+      readyLines(daemonLog) > readyBeforePy,
+      `${readyLines(daemonLog)} MEMSTATE_READY lines, ${readyBeforePy} before the Python runs`);
     p = py(nearCwd, ["--keypath", "notes.a", "--value", "v", "--new-project"]);
     check("gate (python): a cwd that looks like an existing project is refused",
       p.code !== 0 && p.err.includes(`"${PROJECT}"`),
@@ -929,8 +946,9 @@ async function withSharedDaemon(env, fn) {
 // 10.66.0.1 over WireGuard (280 ms round trip) took 680 ms, the proxy gave up
 // after 500 ms, and it tried to start its own daemon on an address that was
 // not local. The proxy must wait for the daemon and attach to it. A proxy that
-// starts a daemon writes the daemon log under $HOME, so an empty $HOME shows
-// that none was started.
+// starts a daemon writes the daemon log next to the DB. runProxy removes
+// MEMSTATE_DB, so the DB is under $HOME, and an empty $HOME shows that no
+// daemon was started.
 async function attachToSlowDaemon() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "memstate-attach-"));
   const fake = http.createServer((req, res) => {
@@ -1014,12 +1032,14 @@ async function noDaemonForRemoteAddr() {
 }
 
 // runProxy runs the proxy smoke test (`--test`) with MEMSTATE_ADDR=addr and
-// HOME=home, and returns its stdout and stderr. The exit code is not checked:
-// on Windows, Node can abort in process.exit while a fetch socket closes
-// (libuv assertion in src\win\async.c), and the smoke test `--test` shows the
-// same with any daemon.
+// HOME=home, and returns its stdout and stderr. MEMSTATE_DB is removed, so the
+// DB and the daemon log of a started daemon are under home. The exit code is
+// not checked: on Windows, Node can abort in process.exit while a fetch socket
+// closes (libuv assertion in src\win\async.c), and the smoke test `--test`
+// shows the same with any daemon.
 async function runProxy(addr, home) {
   const env = { ...process.env, MEMSTATE_ADDR: addr, HOME: home, MEMSTATE_NO_UPDATE_CHECK: "1" };
+  delete env.MEMSTATE_DB;
   const proxy = spawn(process.execPath, [PROXY, "--test"], {
     env,
     stdio: ["ignore", "pipe", "pipe"],

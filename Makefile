@@ -31,6 +31,11 @@ WINCMD := 1
 endif
 endif
 
+# The smoke test in `make test` starts its own daemon. It gets a scratch DB
+# in the ignored tmp/ directory, so it never opens the DB of the user and
+# never writes to the log of the user's daemon (the log is next to the DB).
+SMOKE_DIR := tmp/smoke
+
 # Macro arguments: $1 is the path or the source, $2 the destination.
 # A literal # inside a variable value is written \# or make reads a comment.
 # P renders a path for the host: cmd.exe built-ins want backslashes.
@@ -47,7 +52,7 @@ ALIAS_BIN   = copy /Y "$(call P,$1)" "$(call P,$2)"
 SAY         = echo $1
 BLANK       := echo.
 LS          := dir
-SMOKE_ENV   := set "MEMSTATE_ADDR=" && set "MEMSTATE_NO_UPDATE_CHECK=1" &&
+SMOKE_ENV   := set "MEMSTATE_ADDR=" && set "MEMSTATE_NO_UPDATE_CHECK=1" && set "MEMSTATE_DB=$(call P,$(SMOKE_DIR)/memstate.db)" &&
 MATCH_Q     = findstr /R "$1" >NUL
 XBUILD      = cd server && set "CGO_ENABLED=0" && set "GOOS=$1" && set "GOARCH=$2" && go build -trimpath -ldflags="-s -w" -o ../$(DIST)/$3 .
 VET_OTHER   = cd server && set "GOOS=linux" && go vet ./...
@@ -63,7 +68,7 @@ ALIAS_BIN   = ln -sf "$1" "$2"
 SAY         = echo '$1'
 BLANK       := echo
 LS          := ls -l
-SMOKE_ENV   := env -u MEMSTATE_ADDR MEMSTATE_NO_UPDATE_CHECK=1
+SMOKE_ENV   := env -u MEMSTATE_ADDR MEMSTATE_NO_UPDATE_CHECK=1 MEMSTATE_DB=$(SMOKE_DIR)/memstate.db
 MATCH_Q     = grep -q '$1'
 XBUILD      = cd server && CGO_ENABLED=0 GOOS=$1 GOARCH=$2 go build -trimpath -ldflags="-s -w" -o ../$(DIST)/$3 .
 VET_OTHER   = cd server && GOOS=windows go vet ./...
@@ -149,6 +154,7 @@ test: build  ## Run Go tests + TS end-to-end smoke + MCP regression
 	cd server && go test ./... && go vet ./...
 	$(VET_OTHER)
 	node client/dist/index.js --test
+	$(call RM_RF,$(SMOKE_DIR))
 	$(SMOKE_ENV) node client/dist/index.js --test --embed-model memstate-smoke-model | $(call MATCH_Q,embed_model.:.memstate-smoke-model)
 	node client/test/regression.mjs
 
@@ -170,3 +176,4 @@ clean:  ## Remove build artifacts
 	$(call RM_F,$(SERVER_BIN))
 	$(call RM_RF,client/dist)
 	$(call RM_RF,$(DIST))
+	$(call RM_RF,$(SMOKE_DIR))

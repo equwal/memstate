@@ -121,7 +121,7 @@ Ollama-backed content embeddings are fire-and-forget from the write path via `ma
 | Thing | Path |
 |---|---|
 | SQLite DB | `~/.memstate/memstate.db` (env `MEMSTATE_DB`; `~/` is expanded) |
-| Daemon log | `~/.memstate/memstated.log` |
+| Daemon log | `memstated.log` next to the DB (default `~/.memstate/memstated.log`; `daemonLogPath`, `openDaemonLog`, `_client._memstate_dir`) |
 | Shared daemon address | `~/.memstate/daemon.addr` (next to the DB; written by a `--addr` daemon at startup, removed on shutdown; `discoverAddr()` reads `MEMSTATE_ADDR` first, then this file, and trusts the file only when `/health` answers) |
 | Ollama URL | `http://127.0.0.1:11434` (env `MEMSTATE_OLLAMA_URL`; a URL ending in `/v1` is an OpenAI-compatible server) |
 | Embed model | `nomic-embed-text` (env `MEMSTATE_EMBED_MODEL` or `--embed-model`) |

@@ -293,7 +293,7 @@ search, but its full version history stays readable.
 | Thing | Path |
 |---|---|
 | SQLite DB | `~/.memstate/memstate.db` (override with `MEMSTATE_DB`, and `~/` is expanded) |
-| Daemon log | `~/.memstate/memstated.log` |
+| Daemon log | `memstated.log` next to the DB (default `~/.memstate/memstated.log`) |
 | Ollama URL | `http://127.0.0.1:11434` (override with `MEMSTATE_OLLAMA_URL` or `--ollama-url`; a URL that ends in `/v1` selects an OpenAI-compatible API) |
 | Embed model | `nomic-embed-text` (override with `MEMSTATE_EMBED_MODEL` or `--embed-model`) |
 | Embed timeout | `60s` per Ollama call (override with `MEMSTATE_EMBED_TIMEOUT` or `--embed-timeout`). Must cover a cold model load: a 4B model needs about 20s on first use. |

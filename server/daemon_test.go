@@ -449,3 +449,24 @@ func TestDiscoverAddr(t *testing.T) {
 		t.Fatalf("removeAddrFile with the owning addr must delete the file: %v", err)
 	}
 }
+
+// TestDaemonLogPath: the daemon log is next to the DB. Before this rule, every
+// daemon wrote ~/.memstate/memstated.log, also the test daemons on a temp DB.
+func TestDaemonLogPath(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Skip("no home directory")
+	}
+	dir := t.TempDir()
+	cases := []struct{ db, want string }{
+		{filepath.Join(dir, "t.db"), filepath.Join(dir, "memstated.log")},
+		{"~/x/t.db", filepath.Join(home, "x", "memstated.log")},
+		{"", filepath.Join(home, ".memstate", "memstated.log")},
+	}
+	for _, c := range cases {
+		t.Setenv("MEMSTATE_DB", c.db)
+		if got := daemonLogPath(); got != c.want {
+			t.Errorf("MEMSTATE_DB=%q: daemonLogPath() = %q, want %q", c.db, got, c.want)
+		}
+	}
+}

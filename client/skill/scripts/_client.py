@@ -15,6 +15,7 @@ Env:
   MEMSTATE_ADDR       attach to this host:port (attach mode)
   MEMSTATE_BIN        override the daemon path (default: sibling build / PATH)
   MEMSTATE_LOCAL_URL  full base URL override (for both modes)
+  MEMSTATE_DB         the child's DB; the daemon log goes in the same directory
 """
 import atexit
 import json
@@ -51,11 +52,23 @@ def _resolve_bin() -> str:
     return "memstated"  # fall through to PATH
 
 
+def _memstate_dir() -> Path:
+    """The directory of the DB. Mirrors memstateDir in the TS proxy."""
+    db = os.environ.get("MEMSTATE_DB")
+    if db:
+        if db.startswith("~/"):
+            db = str(Path.home() / db[2:])
+        return Path(db).resolve().parent
+    return Path.home() / ".memstate"
+
+
 def _spawn_child() -> str:
     """Spawn memstated, read banner, wire atexit cleanup. Returns addr."""
     global _child
     bin_path = _resolve_bin()
-    log_path = Path.home() / ".memstate" / "memstated.log"
+    # The daemon log is next to the DB, so a daemon on a test DB does not
+    # write to the log of the user's daemon.
+    log_path = _memstate_dir() / "memstated.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_fd = open(log_path, "a")
 

@@ -331,16 +331,12 @@ func restartPlan(prev *healthResponse, addr string) (args, env []string) {
 
 // startDetachedDaemon launches the (new) binary as a shared daemon in its own
 // session with the config prev reported (see restartPlan), stderr/stdout
-// appended to ~/.memstate/memstated.log — the same file the MCP proxy tees
-// child-mode daemons into.
+// appended to daemonLogPath() — the same file the MCP proxy tees child-mode
+// daemons into.
 func startDetachedDaemon(exePath, addr string, prev *healthResponse) error {
-	var logF *os.File
-	if home, err := os.UserHomeDir(); err == nil {
-		dir := filepath.Join(home, ".memstate")
-		_ = os.MkdirAll(dir, 0o755)
-		logF, _ = os.OpenFile(filepath.Join(dir, "memstated.log"),
-			os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
-	}
+	logPath := daemonLogPath()
+	_ = os.MkdirAll(filepath.Dir(logPath), 0o755)
+	logF, _ := os.OpenFile(logPath, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
 	args, env := restartPlan(prev, addr)
 	cmd := exec.Command(exePath, args...)
 	cmd.Env = append(os.Environ(), env...)
@@ -365,5 +361,5 @@ func startDetachedDaemon(exePath, addr string, prev *healthResponse) error {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	return fmt.Errorf("daemon did not answer /health at %s within 5s (see ~/.memstate/memstated.log)", addr)
+	return fmt.Errorf("daemon did not answer /health at %s within 5s (see %s)", addr, logPath)
 }
