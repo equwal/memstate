@@ -67,7 +67,8 @@ jobs:
   # server holds the `make release` output, and HOME (USERPROFILE and
   # LOCALAPPDATA on Windows) is a scratch directory. Each script runs twice
   # in its documented form (curl | bash, irm | iex): the second run must
-  # leave the same state.
+  # leave the same state. A third run has no test seam: it installs the
+  # latest GitHub release, so the script on this commit must work with it.
   install-scripts:
     needs: build
     strategy:
@@ -101,6 +102,10 @@ jobs:
           unset XDG_DATA_HOME MEMSTATE_ADDR
           export MEMSTATE_DOWNLOAD_URL=http://127.0.0.1:8000 MEMSTATE_SETUP=0 MEMSTATE_INSTALL_SKILL=1
           cat install.sh | bash
+          cat install.sh | bash
+          kill $server
+          trap - EXIT
+          unset MEMSTATE_DOWNLOAD_URL
           cat install.sh | bash
           export PATH="$HOME/.local/bin:$PATH"
           memstated --help >/dev/null 2>&1
@@ -140,6 +145,8 @@ jobs:
           } finally {
             Stop-Process -Id $server.Id -ErrorAction SilentlyContinue
           }
+          Remove-Item Env:MEMSTATE_DOWNLOAD_URL
+          Get-Content -Raw install.ps1 | Invoke-Expression
           $serverDir = Join-Path $env:LOCALAPPDATA 'Programs\memstate\server'
           $userPath = (Get-Item 'HKCU:\Environment').GetValue('Path', '', 'DoNotExpandEnvironmentNames')
           if (@($userPath -split ';') -notcontains $serverDir) { throw "the user PATH does not have $serverDir" }
@@ -168,7 +175,7 @@ jobs:
   # are the raw platform binaries — `memstated upgrade` fetches them by name.
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    needs: [build, install-scripts]
     runs-on: ubuntu-latest
     permissions:
       contents: write

@@ -22,8 +22,8 @@ macOS or Linux (amd64 or arm64):
 curl -fsSL https://raw.githubusercontent.com/map588/memstate/main/install.sh | bash
 ```
 
-Windows 10 1803 or later (amd64, or arm64 through x64 emulation), in
-PowerShell:
+Windows 10 1803 or later on amd64, or Windows 11 on arm64 (it runs the
+amd64 build), in PowerShell:
 
 ```powershell
 irm https://raw.githubusercontent.com/map588/memstate/main/install.ps1 | iex
