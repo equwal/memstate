@@ -67,8 +67,8 @@ jobs:
   # server holds the `make release` output, and HOME (USERPROFILE and
   # LOCALAPPDATA on Windows) is a scratch directory. Each script runs twice
   # in its documented form (curl | bash, irm | iex): the second run must
-  # leave the same state. A third run has no test seam: it installs the
-  # latest GitHub release, so the script on this commit must work with it.
+  # leave the same state. These runs test the files that a tag push is about
+  # to publish, so the release job waits for them.
   install-scripts:
     needs: build
     strategy:
@@ -102,10 +102,6 @@ jobs:
           unset XDG_DATA_HOME MEMSTATE_ADDR
           export MEMSTATE_DOWNLOAD_URL=http://127.0.0.1:8000 MEMSTATE_SETUP=0 MEMSTATE_INSTALL_SKILL=1
           cat install.sh | bash
-          cat install.sh | bash
-          kill $server
-          trap - EXIT
-          unset MEMSTATE_DOWNLOAD_URL
           cat install.sh | bash
           export PATH="$HOME/.local/bin:$PATH"
           memstated --help >/dev/null 2>&1
@@ -145,8 +141,6 @@ jobs:
           } finally {
             Stop-Process -Id $server.Id -ErrorAction SilentlyContinue
           }
-          Remove-Item Env:MEMSTATE_DOWNLOAD_URL
-          Get-Content -Raw install.ps1 | Invoke-Expression
           $serverDir = Join-Path $env:LOCALAPPDATA 'Programs\memstate\server'
           $userPath = (Get-Item 'HKCU:\Environment').GetValue('Path', '', 'DoNotExpandEnvironmentNames')
           if (@($userPath -split ';') -notcontains $serverDir) { throw "the user PATH does not have $serverDir" }
@@ -170,6 +164,35 @@ jobs:
           print("hooks ok:", commands)
           '@ | python - 'C:\Program Files\Git\bin\bash.exe'
           if ($LASTEXITCODE -ne 0) { throw 'the hook check failed' }
+
+      # The script of this commit installs the latest GitHub release, with no
+      # test seam, the same as a user who runs the documented command now. The
+      # script's own --test check is the assertion. A tag push skips this step:
+      # the latest release is then still the previous one, and a script that
+      # needs a file of the new release would stop the release that adds it.
+      - name: install.sh, latest release
+        if: runner.os != 'Windows' && !startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          set -euo pipefail
+          export HOME="$RUNNER_TEMP/home-latest"
+          mkdir -p "$HOME/.claude"
+          unset XDG_DATA_HOME MEMSTATE_ADDR
+          export MEMSTATE_SETUP=0 MEMSTATE_INSTALL_SKILL=1
+          cat install.sh | bash
+
+      - name: install.ps1, latest release
+        if: runner.os == 'Windows' && !startsWith(github.ref, 'refs/tags/')
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:USERPROFILE = Join-Path $env:RUNNER_TEMP 'home-latest'
+          $env:LOCALAPPDATA = Join-Path $env:RUNNER_TEMP 'localappdata-latest'
+          New-Item -ItemType Directory -Force (Join-Path $env:USERPROFILE '.claude'), $env:LOCALAPPDATA | Out-Null
+          Remove-Item Env:MEMSTATE_ADDR -ErrorAction SilentlyContinue
+          $env:MEMSTATE_SETUP = '0'
+          $env:MEMSTATE_INSTALL_SKILL = '1'
+          Get-Content -Raw install.ps1 | Invoke-Expression
 
   # Tag pushes (vX.Y.Z) additionally publish a GitHub Release whose assets
   # are the raw platform binaries — `memstated upgrade` fetches them by name.
