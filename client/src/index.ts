@@ -17,7 +17,7 @@
  *   MEMSTATE_BIN         path to memstated (default: sibling build / PATH)
  *   MEMSTATE_LOCAL_URL   full base URL override
  */
-import { spawn, ChildProcess } from "child_process";
+import { spawn, execSync, ChildProcess } from "child_process";
 import * as fs from "fs";
 import * as net from "net";
 import * as os from "os";
@@ -84,38 +84,32 @@ let daemonAddr = ""; // resolved after ensureDaemon()
 let baseURL = "";
 let managedChild: ChildProcess | null = null;
 
-// ---------- session project ----------
-//
-// A project is any named subject of work: a repository, a product, a topic,
-// a machine. The proxy does not derive one from its working folder, because
-// a folder does not always name the work. Each session names its project on
-// its first write with project_name. The name can be an existing project id
-// or a new one. Later calls without project_id use it. The name lives only in
-// this process, so a new proxy starts without one.
-
-const PROJECT_ID = /^[a-z0-9]+(_[a-z0-9]+)*$/;
-
-const NAME_RULES =
-  "project_name must be lowercase snake_case: words of a-z and 0-9 " +
-  'joined by single underscores, for example "billing_api".';
-
-const NO_PROJECT =
-  "This session has no project yet. Pass project_id, or name the session's " +
-  "project with project_name on a memstate_set or memstate_remember call. " +
-  "memstate_get(list_projects=true) shows the existing project ids.";
-
-let sessionProject = "";
-
-// readProject returns the project of a call that cannot name one.
-function readProject(a: Record<string, unknown>): string {
-  if (a.project_id) return String(a.project_id);
-  if (!sessionProject) throw new Error(NO_PROJECT);
-  return sessionProject;
+// deriveProjectId computes the session's default project_id from the git
+// repo name (or the working directory's basename outside a repo), slugged
+// to lowercase snake_case. MCP clients spawn this proxy in the project
+// directory, so this pins one stable id per repo and stops callers from
+// inventing near-duplicate ids. Outside a repository the id is a guess,
+// which checkDefaultWrite gates; inRepo records which case this is.
+function deriveProjectId(): { id: string; inRepo: boolean } {
+  let base = "";
+  try {
+    const top = execSync("git rev-parse --show-toplevel", {
+      stdio: ["ignore", "pipe", "ignore"],
+    })
+      .toString()
+      .trim();
+    if (top) base = path.basename(top);
+  } catch {
+    /* not a git repo */
+  }
+  const inRepo = base !== "";
+  if (!base) base = path.basename(process.cwd());
+  return { id: slugName(base), inRepo };
 }
 
 // slugName is the shared id rule: lowercase, runs of other characters
 // become "_", edge underscores trimmed. The Python skill and the Go daemon
-// apply the same rule to the host slug.
+// apply the same rule.
 function slugName(name: string): string {
   const slug = name
     .toLowerCase()
@@ -124,52 +118,17 @@ function slugName(name: string): string {
   return slug || "default";
 }
 
-// writeProject returns the project of a set or remember call. A project_name
-// names the session's project once; a different name later is an error.
-function writeProject(a: Record<string, unknown>): string {
-  const name = a.project_name;
-  if (name !== undefined && a.scope === "user") {
-    throw new Error('pass scope="user" or project_name, not both');
-  }
-  if (name !== undefined) {
-    if (typeof name !== "string" || !PROJECT_ID.test(name)) {
-      throw new Error(NAME_RULES);
-    }
-    if (sessionProject && name !== sessionProject) {
-      throw new Error(
-        `this session's project is already "${sessionProject}"; omit ` +
-          "project_name, or pass project_id to write to another project"
-      );
-    }
-    sessionProject = name;
-  }
-  return resolveProject(a);
-}
-
-// PROJECT_NAME_PROPERTY is the project_name argument of the write tools.
-const PROJECT_NAME_PROPERTY = {
-  type: "string",
-  description:
-    "Names this session's project, once, on the first write without " +
-    "project_id: an id from memstate_get(list_projects=true) when the work " +
-    "belongs to an existing project, else a new lowercase snake_case name " +
-    "for the subject of the work.",
-};
-
-// PROJECT_ID_PROPERTY is the project_id argument of the tools that default
-// to the session's project.
-const PROJECT_ID_PROPERTY = {
-  type: "string",
-  description:
-    "OMIT to use this session's project (named by project_name on the " +
-    "first write). Only pass an id that memstate_get(list_projects=true) " +
-    "lists — never invent a variant.",
-};
+const { id: DEFAULT_PROJECT, inRepo: CWD_IN_REPO } = deriveProjectId();
+// The home directory names the user, not a project: no write lands in its
+// project, and its name is never accepted as a pin or an explicit write
+// target (see checkWriteTarget). Reads stay open so old data can migrate.
+const CWD_IS_HOME = path.resolve(process.cwd()) === path.resolve(os.homedir());
+const HOME_SLUG = slugName(path.basename(os.homedir()));
 
 // USER_PROJECT is the daemon's one reserved project for facts about the
 // user and the host. The daemon rejects writes there outside a short
-// allowlist of keypath shapes. project_name must start with a-z or 0-9, so
-// no session can name it.
+// allowlist of keypath shapes. slugName never yields a leading "_", so no
+// repo can collide with it.
 const USER_PROJECT = "_user";
 
 // HOST_SLUG names this machine under host.<slug> in USER_PROJECT: the first
@@ -181,17 +140,296 @@ const SCOPE_PROP = {
   enum: ["project", "user"],
   default: "project",
   description:
-    '"project" (default) = the memories of the project. "user" = the ' +
-    "reserved user scope: facts about the user or this machine that hold " +
-    "in every project (preferences, profile, host env, host tools). Never " +
-    'both scope "user" and project_id or project_name.',
+    '"project" (default) = the cwd project\'s memories. "user" = the reserved ' +
+    "user scope: facts about the user or this machine that hold in every " +
+    "repo (preferences, profile, host env, host tools). Never both scope " +
+    '"user" and project_id.',
 };
 
 type ToolArgs = Record<string, unknown>;
 
+// ---------- session project ----------
+//
+// The cwd project is the default and the strong prior. On the first prompt
+// the recall hook shows the model the cwd project and the other projects the
+// prompt matches; when the prompt is clearly about another subject, the model
+// pins this session to that project once with project_name. The pin lives in
+// this process only. Caution rules keep misspelled or invented names out of
+// the store: an existing id pins freely, a new id needs new_project=true and
+// is refused when it looks like an existing one.
+
+const PROJECT_ID_RE = /^[a-z0-9]+(_[a-z0-9]+)*$/;
+
+const PROJECT_NAME_PROP = {
+  type: "string",
+  description:
+    "Pin this session to a project other than the cwd project, when the " +
+    "prompt is clearly about another subject. One pin per session: later " +
+    "calls without project_id use it. Prefer an id that " +
+    "memstate_get(list_projects=true) lists. A new id also needs " +
+    "new_project=true and must not resemble an existing id. Not with " +
+    'project_id or scope="user".',
+};
+
+const NEW_PROJECT_PROP = {
+  type: "boolean",
+  default: false,
+  description:
+    "Allow this call to create a project that does not exist yet, or revive " +
+    "a soft-deleted one: with project_name, or on a write with project_id " +
+    "or with the cwd project outside a git repository. Refused when the id " +
+    "looks like a misspelling of an existing project, and an error where " +
+    "nothing can be created.",
+};
+
+let sessionProject = "";
+
+// normalizeId folds the spellings that produce near-duplicate projects:
+// underscores, digits and a trailing dev/test/tmp/old/new.
+function normalizeId(id: string): string {
+  return id
+    .replace(/_/g, "")
+    .replace(/[0-9]/g, "")
+    .replace(/(dev|test|tests|tmp|old|new)$/, "");
+}
+
+function levenshtein(a: string, b: string): number {
+  const prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    let last = i;
+    for (let j = 1; j <= b.length; j++) {
+      const cur = Math.min(
+        prev[j] + 1,
+        last + 1,
+        prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1)
+      );
+      prev[j - 1] = last;
+      last = cur;
+    }
+    prev[b.length] = last;
+  }
+  return prev[b.length];
+}
+
+// nearDuplicates lists existing ids that name looks like: equal after
+// normalization, one contains the other (both at least four characters), or
+// a small edit distance.
+function nearDuplicates(name: string, ids: string[]): string[] {
+  const n = normalizeId(name);
+  return ids.filter((id) => {
+    if (id === name) return false;
+    const m = normalizeId(id);
+    if (n === m) return true;
+    if (n.length >= 4 && m.length >= 4 && (n.includes(m) || m.includes(n))) return true;
+    const limit = Math.min(n.length, m.length) < 6 ? 1 : 2;
+    return levenshtein(n, m) <= limit;
+  });
+}
+
+// Reserved ids start with "_". The daemon lists _user among the projects,
+// but for the model it is scope="user", never a project id.
+function isReservedId(id: string): boolean {
+  return id.startsWith("_");
+}
+
+async function listProjectIds(): Promise<string[]> {
+  const out = (await getJSON("/projects")) as { projects?: { id: string }[] };
+  return (out.projects ?? []).map((p) => p.id).filter((id) => !isReservedId(id));
+}
+
+// Errors shared by the pin and the write gate.
+function reservedIdError(id: string): Error {
+  return new Error(
+    `project ids that start with "_" are reserved ("${id}"); use scope="user" for the user scope`
+  );
+}
+function homeNameError(id: string): Error {
+  return new Error(
+    `"${id}" is the name of your home directory, which names the user, not a project; ` +
+      'pin another project with project_name, or use scope="user" for facts about this machine'
+  );
+}
+
+// ---------- pin file for the recall hook ----------
+//
+// The UserPromptSubmit hook (memstated recall) runs outside this process
+// and derives the project from the cwd. A pinned session publishes its pin
+// as one file per proxy process, <db dir>/recall/pins/<pid>, holding
+// "cwd\nproject\n". The hook follows a file whose PID is alive and prunes
+// the rest; this process removes its own file on exit.
+function memstateDir(): string {
+  const db = process.env.MEMSTATE_DB;
+  if (db) {
+    const expanded = db.startsWith("~/") ? path.join(os.homedir(), db.slice(2)) : db;
+    return path.dirname(path.resolve(expanded));
+  }
+  return path.join(os.homedir(), ".memstate");
+}
+const PIN_FILE = path.join(memstateDir(), "recall", "pins", String(process.pid));
+let pinFileWritten = false;
+
+function removePinFile(): void {
+  try {
+    fs.rmSync(PIN_FILE, { force: true });
+  } catch {
+    /* best effort */
+  }
+}
+
+function writePinFile(project: string): void {
+  try {
+    fs.mkdirSync(path.dirname(PIN_FILE), { recursive: true });
+    const tmp = `${PIN_FILE}.tmp`;
+    fs.writeFileSync(tmp, `${process.cwd()}\n${project}\n`);
+    fs.renameSync(tmp, PIN_FILE);
+    if (!pinFileWritten) {
+      pinFileWritten = true;
+      process.on("exit", removePinFile);
+    }
+  } catch (err) {
+    process.stderr.write(
+      `memstate: could not publish the session pin for the recall hook: ${String(err)}\n`
+    );
+  }
+}
+
+// pinSession applies project_name: reserved and home names are refused,
+// then format, one pin per session, existing id or a deliberate new one
+// that resembles nothing.
+async function pinSession(a: ToolArgs): Promise<void> {
+  const name = a.project_name;
+  if (a.project_id || a.scope === "user") {
+    throw new Error('project_name cannot be combined with project_id or scope="user"');
+  }
+  if (typeof name !== "string") {
+    throw new Error("project_name must be a string");
+  }
+  if (isReservedId(name)) throw reservedIdError(name);
+  if (!PROJECT_ID_RE.test(name)) {
+    throw new Error(
+      "project_name must be lowercase snake_case: words of a-z and 0-9 joined " +
+        'by single underscores, for example "billing_api"'
+    );
+  }
+  if (name === HOME_SLUG) throw homeNameError(name);
+  if (sessionProject && name !== sessionProject) {
+    throw new Error(
+      `this session is pinned to "${sessionProject}"; pass project_id to reach another project`
+    );
+  }
+  if (name === sessionProject) return;
+  const ids = await listProjectIds();
+  if (ids.includes(name)) {
+    knownProjects.add(name);
+    sessionProject = name;
+    writePinFile(name);
+    return;
+  }
+  const near = nearDuplicates(name, ids);
+  if (near.length > 0) {
+    throw new Error(
+      `"${name}" looks like existing project ${near.map((id) => `"${id}"`).join(", ")}; ` +
+        `use project_name="${near[0]}", or choose a clearly different name`
+    );
+  }
+  if (a.new_project !== true) {
+    throw new Error(
+      `no project "${name}". Pass an id from memstate_get(list_projects=true), ` +
+        "or new_project=true to start a new project"
+    );
+  }
+  sessionProject = name;
+  writePinFile(name);
+}
+
+// knownProjects caches positive /projects answers: a project seen there
+// needs no further check in this process. memstate_delete_project removes
+// its id, so a revive needs new_project=true like any other creation.
+const knownProjects = new Set<string>();
+
+// checkWriteTarget enforces the one creation rule for writes: a write never
+// creates a project unless it targets the git repository this session runs
+// in, or the call carries new_project=true and the id resembles no existing
+// project. The home directory names the user, so its project is refused
+// outright, by cwd and by name. A deliberate near-duplicate needs the
+// memstate CLI, which is a human's tool. Refusals create nothing; a
+// successful create is not cached, so the next write asks /projects again
+// and finds the project.
+async function checkWriteTarget(id: string, a: ToolArgs, explicit: boolean): Promise<void> {
+  if (!explicit) {
+    if (CWD_IN_REPO) return;
+    if (CWD_IS_HOME) {
+      throw new Error(
+        "the working directory is your home directory, which has no default " +
+          "project for writes. Pin a project with project_name (an id from " +
+          "memstate_get(list_projects=true), or a new id with new_project=true), " +
+          'or use scope="user" for facts about this machine'
+      );
+    }
+  } else if (id === HOME_SLUG) {
+    throw homeNameError(id);
+  }
+  if (knownProjects.has(id)) return;
+  const ids = await listProjectIds();
+  if (ids.includes(id)) {
+    knownProjects.add(id);
+    return;
+  }
+  const where = explicit
+    ? `project "${id}" does not exist`
+    : `the working directory is not a git repository and its project "${id}" does not exist`;
+  const near = nearDuplicates(id, ids);
+  if (near.length > 0) {
+    const fix = explicit
+      ? `use project_id="${near[0]}"`
+      : `pin the session with project_name="${near[0]}"`;
+    throw new Error(
+      `${where} but looks like existing project ${near.map((n) => `"${n}"`).join(", ")}; ${fix}. ` +
+        `To create "${id}" as a separate project, use the memstate CLI`
+    );
+  }
+  if (a.new_project !== true) {
+    const other = explicit
+      ? "Pass an id from memstate_get(list_projects=true)"
+      : "Pass project_name=<an id from memstate_get(list_projects=true)> to use another project";
+    throw new Error(
+      `${where}. ${other}, new_project=true to create "${id}" (this also revives a ` +
+        `soft-deleted project), or scope="user" for facts about this machine`
+    );
+  }
+}
+
+// checkNewProjectFlag rejects new_project where nothing can be created, so
+// an agent that passes it by habit is corrected instead of ignored. With
+// project_name the flag belongs to the pin and is judged there.
+function checkNewProjectFlag(a: ToolArgs, write: boolean): void {
+  if (a.new_project !== true || a.project_name !== undefined) return;
+  if (!write) {
+    throw new Error(
+      "new_project has no effect on this call: only a write, or a pin with " +
+        "project_name, creates a project"
+    );
+  }
+  if (a.scope === "user") {
+    throw new Error('new_project has no effect with scope="user": the user scope always exists');
+  }
+  if (!a.project_id && !sessionProject && CWD_IN_REPO) {
+    throw new Error(
+      `new_project has no effect here: the project of the git repository you are in ` +
+        `("${DEFAULT_PROJECT}") is created without it`
+    );
+  }
+}
+
 // resolveProject picks the project id for a call: the reserved user
-// project for scope "user", else the explicit id, else the session's.
-function resolveProject(a: ToolArgs): string {
+// project for scope "user", else the explicit id, else the session pin,
+// else the cwd project. A write to an explicit id or to the cwd project
+// passes checkWriteTarget first; a pinned project was checked at pin time.
+async function resolveProject(a: ToolArgs, write = false): Promise<string> {
+  if (a.project_name !== undefined) {
+    await pinSession(a);
+  }
+  checkNewProjectFlag(a, write);
   if (a.scope === "user") {
     if (a.project_id) {
       throw new Error('pass scope="user" or project_id, not both');
@@ -201,14 +439,30 @@ function resolveProject(a: ToolArgs): string {
   if (a.scope !== undefined && a.scope !== "project") {
     throw new Error(`unknown scope ${JSON.stringify(a.scope)}; use "project" or "user"`);
   }
-  return readProject(a);
+  if (a.project_id) {
+    const id = String(a.project_id);
+    if (isReservedId(id)) throw reservedIdError(id);
+    if (write) await checkWriteTarget(id, a, true);
+    return id;
+  }
+  if (sessionProject) return sessionProject;
+  if (write) await checkWriteTarget(DEFAULT_PROJECT, a, false);
+  return DEFAULT_PROJECT;
 }
 
-// stripScope removes the proxy-only `scope` field before a body reaches
-// the daemon, which rejects unknown fields.
-function stripScope(a: ToolArgs): ToolArgs {
-  const { scope: _scope, ...rest } = a;
+// stripProxyFields removes the fields only the proxy understands before a
+// body reaches the daemon, which rejects unknown fields.
+function stripProxyFields(a: ToolArgs): ToolArgs {
+  const { scope: _scope, project_name: _name, new_project: _new, ...rest } = a;
   return rest;
+}
+
+// withSessionProject tells the model which project a pinned session uses.
+function withSessionProject(result: unknown): unknown {
+  if (sessionProject && result && typeof result === "object" && !Array.isArray(result)) {
+    return { ...(result as Record<string, unknown>), session_project: sessionProject };
+  }
+  return result;
 }
 
 type TreeNode = { name: string; children?: TreeNode[]; has_value?: boolean };
@@ -244,7 +498,8 @@ function resolveDaemonBin(): string {
   if (process.env.MEMSTATE_BIN && fs.existsSync(process.env.MEMSTATE_BIN)) {
     return process.env.MEMSTATE_BIN;
   }
-  const sibling = path.resolve(__dirname, "..", "..", "server", "memstated");
+  const exe = process.platform === "win32" ? ".exe" : "";
+  const sibling = path.resolve(__dirname, "..", "..", "server", "memstated" + exe);
   if (fs.existsSync(sibling)) return sibling;
   return "memstated"; // fall through to PATH
 }
@@ -306,8 +561,10 @@ async function probeHealth(addr: string): Promise<HealthProbe> {
   }
 }
 
+// openDaemonLog opens the daemon log next to the DB, so a daemon on a test DB
+// does not write to the log of the user's daemon.
 function openDaemonLog(): { logFD: number | null; logPath: string } {
-  const logDir = path.join(process.env.HOME ?? "/tmp", ".memstate");
+  const logDir = memstateDir();
   try {
     fs.mkdirSync(logDir, { recursive: true });
   } catch {}
@@ -581,8 +838,16 @@ const TOOLS: ToolDef[] = [
     inputSchema: {
       type: "object",
       properties: {
-        project_id: PROJECT_ID_PROPERTY,
+        project_id: {
+          type: "string",
+          description:
+            "OMIT to use the cwd project (this session\'s default). " +
+            "Only pass an id that memstate_get(list_projects=true) " +
+            "lists — never invent a variant.",
+        },
         scope: SCOPE_PROP,
+        project_name: PROJECT_NAME_PROP,
+        new_project: NEW_PROJECT_PROP,
         keypath: {
           type: "string",
           description:
@@ -615,13 +880,12 @@ const TOOLS: ToolDef[] = [
             "subject tags, lowercase snake_case, e.g. [\"auth\", " +
             "\"embeddings\"]. Search matches ANY listed topic.",
         },
-        project_name: PROJECT_NAME_PROPERTY,
       },
       required: ["keypath", "value"],
     },
-    handler: (a) =>
+    handler: async (a) =>
       postJSON("/memories/store", {
-        project_id: writeProject(a),
+        project_id: await resolveProject(a, true),
         keypath: a.keypath,
         content: a.value,
         source: a.source,
@@ -644,8 +908,16 @@ const TOOLS: ToolDef[] = [
     inputSchema: {
       type: "object",
       properties: {
-        project_id: PROJECT_ID_PROPERTY,
+        project_id: {
+          type: "string",
+          description:
+            "OMIT to use the cwd project (this session\'s default). " +
+            "Only pass an id that memstate_get(list_projects=true) " +
+            "lists — never invent a variant.",
+        },
         scope: SCOPE_PROP,
+        project_name: PROJECT_NAME_PROP,
+        new_project: NEW_PROJECT_PROP,
         keypath: {
           type: "string",
           description:
@@ -681,31 +953,33 @@ const TOOLS: ToolDef[] = [
             "keypaths, e.g. \"notes\" stores `## Auth` at `notes.auth`. " +
             "Default is none — sections are stored at the top level.",
         },
-        project_name: PROJECT_NAME_PROPERTY,
       },
       required: ["content"],
     },
-    handler: (a) => {
-      // The daemon rejects unknown fields; project_name and scope are
-      // proxy-only.
-      const body = stripScope(a);
-      delete body.project_name;
-      body.project_id = writeProject(a);
-      return postJSON("/memories/remember", body);
-    },
+    handler: async (a) =>
+      postJSON("/memories/remember", {
+        ...stripProxyFields(a),
+        project_id: await resolveProject(a, true),
+      }),
   },
   {
     name: "memstate_get",
     description:
-      "Read memories. No keypath → the project's keypath tree (NAMES " +
+      "Read memories. No arguments → this repo's keypath tree (NAMES " +
       "ONLY, no content); pass `keypath` → the memories at that keypath " +
       "and below, with content; pass `list_projects: true` → all project " +
       "ids in the store. Call at task start to load prior context.",
     inputSchema: {
       type: "object",
       properties: {
-        project_id: PROJECT_ID_PROPERTY,
+        project_id: {
+          type: "string",
+          description:
+            "OMIT to use the cwd project (this session's default)",
+        },
         scope: SCOPE_PROP,
+        project_name: PROJECT_NAME_PROP,
+        new_project: NEW_PROJECT_PROP,
         keypath: {
           type: "string",
           description:
@@ -724,9 +998,10 @@ const TOOLS: ToolDef[] = [
     },
     handler: async (a) => {
       if (a.list_projects) {
-        return getJSON("/projects");
+        const out = (await getJSON("/projects")) as { projects?: { id: string }[] };
+        return { ...out, projects: (out.projects ?? []).filter((p) => !isReservedId(p.id)) };
       }
-      const pid = resolveProject(a);
+      const pid = await resolveProject(a);
       if (a.keypath) {
         return postJSON("/keypaths", {
           project_id: pid,
@@ -765,8 +1040,8 @@ const TOOLS: ToolDef[] = [
     description:
       "Find current memories when you don't know the exact keypath. Only " +
       "the latest version of each keypath is searched; deleted keypaths " +
-      "and deleted projects never match. Searches this session's project " +
-      "by default; pass all_projects=true to search the whole store.",
+      "and deleted projects never match. Searches this repo's project by " +
+      "default; pass all_projects=true to search the whole store.",
     inputSchema: {
       type: "object",
       properties: {
@@ -776,12 +1051,18 @@ const TOOLS: ToolDef[] = [
             "plain words — no quoting or boolean operators needed; " +
             "punctuation is handled",
         },
-        project_id: PROJECT_ID_PROPERTY,
+        project_id: {
+          type: "string",
+          description:
+            "OMIT to use the cwd project (this session's default)",
+        },
         scope: SCOPE_PROP,
+        project_name: PROJECT_NAME_PROP,
+        new_project: NEW_PROJECT_PROP,
         all_projects: {
           type: "boolean",
           default: false,
-          description: "search every project in the store instead of one",
+          description: "search every project in the store instead of just this repo's",
         },
         limit: { type: "integer", default: 20 },
         mode: {
@@ -824,9 +1105,9 @@ const TOOLS: ToolDef[] = [
       required: ["query"],
     },
     handler: async (a) => {
-      const { all_projects, ...body } = stripScope(a);
+      const { all_projects, ...body } = stripProxyFields(a);
       if (!all_projects) {
-        body.project_id = resolveProject(a);
+        body.project_id = await resolveProject(a);
       }
       const out = (await postJSON("/memories/search", body)) as {
         results?: { keypath: string }[];
@@ -846,13 +1127,19 @@ const TOOLS: ToolDef[] = [
       "Every stored version of ONE keypath, newest first, including " +
       "tombstones. Use to see what a fact was before it changed. Identify " +
       "the keypath either by `keypath` (project_id defaults to this " +
-      "session's project), or by the integer `id` of any memory in the " +
-      "chain (from a previous response).",
+      "repo's), or by the integer `id` of any memory in the chain (from a " +
+      "previous response).",
     inputSchema: {
       type: "object",
       properties: {
-        project_id: PROJECT_ID_PROPERTY,
+        project_id: {
+          type: "string",
+          description:
+            "OMIT to use the cwd project (this session's default)",
+        },
         scope: SCOPE_PROP,
+        project_name: PROJECT_NAME_PROP,
+        new_project: NEW_PROJECT_PROP,
         keypath: { type: "string", description: "required unless memory_id is given" },
         memory_id: {
           type: "integer",
@@ -861,10 +1148,10 @@ const TOOLS: ToolDef[] = [
         },
       },
     },
-    handler: (a) => {
-      const body = stripScope(a);
+    handler: async (a) => {
+      const body = stripProxyFields(a);
       if (body.keypath) {
-        body.project_id = resolveProject(a);
+        body.project_id = await resolveProject(a);
       }
       return postJSON("/memories/history", body);
     },
@@ -880,8 +1167,14 @@ const TOOLS: ToolDef[] = [
     inputSchema: {
       type: "object",
       properties: {
-        project_id: PROJECT_ID_PROPERTY,
+        project_id: {
+          type: "string",
+          description:
+            "OMIT to use the cwd project (this session's default)",
+        },
         scope: SCOPE_PROP,
+        project_name: PROJECT_NAME_PROP,
+        new_project: NEW_PROJECT_PROP,
         keypath: { type: "string", description: "exact keypath, or subtree root when recursive" },
         recursive: {
           type: "boolean",
@@ -891,10 +1184,10 @@ const TOOLS: ToolDef[] = [
       },
       required: ["keypath"],
     },
-    handler: (a) =>
+    handler: async (a) =>
       postJSON("/memories/delete", {
-        ...stripScope(a),
-        project_id: resolveProject(a),
+        ...stripProxyFields(a),
+        project_id: await resolveProject(a),
       }),
   },
   {
@@ -908,23 +1201,25 @@ const TOOLS: ToolDef[] = [
       properties: { project_id: { type: "string" } },
       required: ["project_id"],
     },
-    handler: (a) => postJSON("/projects/delete", a),
+    handler: (a) => {
+      knownProjects.delete(String(a.project_id));
+      return postJSON("/projects/delete", a);
+    },
   },
 ];
 
-const INSTRUCTIONS = `memstate — persistent memory across sessions, kept in named projects.
+// DEFAULT_ORIGIN tells the model where its default project id came from
+// and, outside a repository, that writes to it are gated.
+const DEFAULT_ORIGIN = CWD_IN_REPO
+  ? "derived from the git repository name"
+  : CWD_IS_HOME
+    ? "derived from the home directory, which has no default project for writes; see Session project"
+    : "derived from the directory name, which is not a git repository; see Session project";
 
-A project is any named subject of work: a repository, a product, a topic, a
-machine. It is not tied to a folder, and this session has no project until
-it names one. Name it on the first memstate_set or memstate_remember call
-without project_id: pass project_name = an id that
-memstate_get(list_projects=true) lists when the work belongs to that
-project, else a new short snake_case name for the subject of the work.
-Later calls without project_id use that project.
+const INSTRUCTIONS = `memstate — persistent memory across sessions, scoped per project.
 
 When to use:
-- Task start: memstate_get(list_projects=true), then
-  memstate_get(project_id=...) to load prior context.
+- Task start: memstate_get(project_id=...) to load prior context.
 - Task end: memstate_remember to save decisions, progress, and key facts.
 - Mid-task: memstate_search when you suspect prior context exists but don't
   know the keypath; memstate_set for single-fact updates (config, status).
@@ -938,11 +1233,12 @@ Writes are versioned: writing an existing keypath supersedes the old value
 and returns it to you, so you see what changed. Deletes keep history.
 
 Conventions — follow these EXACTLY; every deviation fragments the store:
-- project_id: OMIT it after the session names its project. Only pass
-  project_id to reach a DIFFERENT project, and then only an id that
-  memstate_get(list_projects=true) actually lists — NEVER invent a
-  variant: "my-app", "myapp", and "my_app_dev" each create a separate,
-  disconnected project.
+- project_id: OMIT it. The cwd project is "${DEFAULT_PROJECT}"
+  (${DEFAULT_ORIGIN}); it is used whenever project_id
+  is absent. Only pass project_id to reach a DIFFERENT project, and then
+  only an id that memstate_get(list_projects=true) actually lists — NEVER
+  invent a variant: "my-app", "myapp", and "my_app_dev" each create a
+  separate, disconnected project.
 - keypath segments: lowercase snake_case only ([a-z0-9_]), joined by dots.
   Dates are YYYY_MM_DD inside a segment: "task.summary.2026_07_03" — never
   "2026-07-03" (kebab) and never camelCase or spaces anywhere.
@@ -985,7 +1281,37 @@ User scope — facts that are not about this project:
   This machine's host slug is "${HOST_SLUG}". Host facts need an explicit
   keypath; heading extraction fits only "## Preferences" and "## Profile".
 - Never store secrets, tokens, or credentials in any scope. The denied-prompt
-  rule applies to the user scope too.`;
+  rule applies to the user scope too.
+
+Session project — when the prompt is not about this directory:
+- The cwd project is the default and almost always right. On the first
+  prompt the recall hook shows a <memstate-scope> block: the cwd project and
+  the other projects the prompt matches. Judge from it. When the user
+  clearly works on another subject (for example "set up my nginx config"
+  from the home directory), pin this session with project_name on your
+  first memstate call. Later calls without project_id use that project.
+  Results then carry session_project.
+- Prefer an id that memstate_get(list_projects=true) lists. A new id needs
+  new_project=true as well, and is refused when it looks like an existing
+  id ("regress_tests" vs "regress_test", "my_app_dev" vs "my_app"). Never
+  invent a variant of an existing name.
+- One pin per session; a different project_name later is an error. Pass
+  project_id to reach another project for one call.
+- One rule for creating projects: a write (memstate_set, memstate_remember)
+  never creates a project unless it targets the git repository this
+  session runs in, or the call carries new_project=true. This holds for
+  the cwd project outside a git repository, for an explicit project_id,
+  and for a soft-deleted project (new_project=true revives it). A name
+  that resembles an existing project is always refused: use the existing
+  project. Reads are never gated, and a refusal creates nothing.
+- The home directory has no default project for writes at all, and its
+  name is never a project: pin another project with project_name, or use
+  scope="user" for facts about this machine.
+- Ids that start with "_" are reserved. The user scope is scope="user",
+  never a project_id or project_name; list_projects does not show it.
+- new_project=true is an error where nothing can be created: on a read
+  without project_name, with scope="user", or for the git repository's
+  own project. Pass it only on the call that creates or revives a project.`;
 
 // ---------- main ----------
 
@@ -1035,7 +1361,7 @@ async function main(): Promise<void> {
       };
     }
     try {
-      const result = await tool.handler(request.params.arguments ?? {});
+      const result = withSessionProject(await tool.handler(request.params.arguments ?? {}));
       return {
         content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
       };

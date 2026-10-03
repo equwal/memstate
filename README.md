@@ -11,8 +11,120 @@ your agent starts and stops when your agent stops.
 
 ## Install
 
-You need Go 1.27+ and Node 18+. Semantic search also needs a local
-[Ollama](https://ollama.com) with an embedding model pulled:
+### Install script
+
+You need Node 18 or later. The script checks for it before it downloads
+anything.
+
+macOS or Linux (amd64 or arm64):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/map588/memstate/main/install.sh | bash
+```
+
+Windows 10 1803 or later on amd64, or Windows 11 on arm64 (it runs the
+amd64 build), in PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/map588/memstate/main/install.ps1 | iex
+```
+
+The script does these steps:
+
+1. It downloads the newest [release](https://github.com/map588/memstate/releases):
+   the `memstated` daemon for your platform and `memstate-mcp.tar.gz`,
+   which holds the MCP proxy and its Node packages.
+2. It installs both. Then it starts the proxy once with a scratch
+   database, to make sure that the proxy finds the daemon.
+3. In a terminal, it runs `memstate-mcp setup`. Setup finds Claude Code,
+   Claude Desktop, Cursor and Windsurf, asks for the embedding model, and
+   asks before it changes a config.
+4. It asks whether to install the Claude Code skill and hooks (see
+   below).
+
+Where the files go:
+
+| | macOS, Linux | Windows |
+|---|---|---|
+| Programs | `~/.local/share/memstate/` (`$XDG_DATA_HOME/memstate` when set) | `%LOCALAPPDATA%\Programs\memstate\` |
+| Commands | links in `~/.local/bin`: `memstated`, `memstate`, `memstate-mcp` | the `server\` directory of the programs, added to your user PATH |
+
+The proxy finds the daemon next to it, in `server/`, so the MCP config
+does not depend on PATH. Your memories stay in `~/.memstate/`.
+
+Set these environment variables to change what the script does:
+
+- `MEMSTATE_VERSION=v0.7.8` installs that release, not the newest one.
+- `MEMSTATE_INSTALL_DIR` changes the directory for the links (macOS, Linux).
+- `MEMSTATE_SETUP=0` or `1` skips or runs `memstate-mcp setup` with no prompt.
+- `MEMSTATE_INSTALL_SKILL=0` or `1` skips or installs the skill with no prompt.
+
+For example:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/map588/memstate/main/install.sh | MEMSTATE_INSTALL_SKILL=1 bash
+```
+
+```powershell
+$env:MEMSTATE_INSTALL_SKILL = '1'; irm https://raw.githubusercontent.com/map588/memstate/main/install.ps1 | iex
+```
+
+To update, run the script again. It replaces the daemon and the proxy
+together. `memstated upgrade` replaces only the daemon.
+
+To uninstall on macOS or Linux:
+
+```bash
+python3 ~/.local/share/memstate/configure-claude-hook.py uninstall   # removes the hooks from settings.json
+rm -rf ~/.local/share/memstate ~/.claude/skills/memstate ~/.claude/hooks/memstate-*.sh
+rm -f ~/.local/bin/memstated ~/.local/bin/memstate ~/.local/bin/memstate-mcp
+claude mcp remove memstate --scope user
+```
+
+To uninstall on Windows:
+
+```powershell
+python "$env:LOCALAPPDATA\Programs\memstate\configure-claude-hook.py" uninstall
+Remove-Item -Recurse -Force "$env:LOCALAPPDATA\Programs\memstate", "$HOME\.claude\skills\memstate", "$HOME\.claude\hooks\memstate-*.sh"
+claude mcp remove memstate --scope user
+```
+
+Then remove `%LOCALAPPDATA%\Programs\memstate\server` from your user PATH.
+Remove the `memstate` entry from the config of each other MCP client.
+
+### Build from source
+
+You need Go 1.27+ and Node 18+.
+
+```bash
+git clone git@github.com:map588/memstate.git
+cd memstate
+make install
+```
+
+This puts two programs on your PATH:
+
+- `memstated`: the Go daemon. It installs to `$(go env GOPATH)/bin`, or to `$GOBIN` when set.
+- `memstate-mcp`: the MCP stdio proxy, linked from `client/` with `npm link`.
+
+`make uninstall` removes both. `make build` compiles in place and does
+not touch PATH. `make test` runs the Go tests, the end-to-end smoke
+test, and the MCP regression suite (`client/test/regression.mjs`), which
+calls each tool through the real proxy and daemon against a temporary
+database.
+
+On Windows the same `make` targets run from cmd.exe or PowerShell with
+GNU make (for example `choco install make`), Go, Node and Python on PATH;
+no bash and no coreutils are needed. The build produces `memstated.exe`,
+and `make install` copies it to GOBIN as `memstated.exe` and
+`memstate.exe` instead of a symlink. Git Bash and WSL work too. The hook
+scripts that `make install-skill` copies are bash scripts and need Git
+Bash to run.
+
+### Embeddings (optional)
+
+Semantic search needs a local [Ollama](https://ollama.com) with an
+embedding model pulled:
 
 ```bash
 ollama pull nomic-embed-text
@@ -47,46 +159,12 @@ When the server rejects a long memory ("context length" from Ollama,
 "too large to process" from llama.cpp), the daemon halves the text and
 tries again.
 
-```bash
-git clone git@github.com:map588/memstate.git
-cd memstate
-make install
-```
-
-This puts two programs on your PATH:
-
-- `memstated`: the Go daemon. It installs to `$(go env GOPATH)/bin`, or to `$GOBIN` when set.
-- `memstate-mcp`: the MCP stdio proxy, linked from `client/` with `npm link`.
-
-`make uninstall` removes both. `make build` compiles in place and does
-not touch PATH. `make test` runs the Go tests, the end-to-end smoke
-test, and the MCP regression suite (`client/test/regression.mjs`), which
-calls each tool through the real proxy and daemon against a temporary
-database.
-
-### Daemon only, without Go
-
-To get only `memstated` as a prebuilt binary (Linux or macOS, amd64 or
-arm64), run the install script. It downloads the newest
-[release](https://github.com/map588/memstate/releases) into
-`~/.local/bin`:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/map588/memstate/main/install.sh | bash
-```
-
-Set `MEMSTATE_VERSION=v0.7.0` to pin a release, or
-`MEMSTATE_INSTALL_DIR` to change the directory. Later,
-`memstated upgrade` replaces the binary with the newest release.
-
-The script does not install the MCP proxy. `memstate-mcp` needs Node
-and is built from this repository with `make install` or `make build`.
-
 ### Claude Code skill and hook (optional)
 
-If you use Claude Code, `make install-skill` installs the bundled
-skill under `~/.claude/skills/memstate/`. It also adds two
-UserPromptSubmit hooks:
+If you use Claude Code, the install script asks whether to install the
+bundled skill. From a clone, `make install-skill` installs it. The skill
+goes to `~/.claude/skills/memstate/`, and two UserPromptSubmit hooks are
+added:
 
 - `memstate-persist-reminder.sh` points you to `memstate_remember`
   after three or more file edits since your last persist.
@@ -98,11 +176,19 @@ UserPromptSubmit hooks:
   `~/.memstate/daemon.addr`. Without one the hook prints nothing.
   Set `MEMSTATE_NO_RECALL=1` to turn it off.
 
+The skill scripts need Python 3. The hooks are bash scripts. On Windows,
+Claude Code runs hooks with Git Bash, so the install script adds the
+hooks only when it finds Git Bash. The persist reminder also needs `jq`
+and does nothing without it.
+
 `make uninstall-skill` removes the skill and both hooks. The install
 is idempotent and safe to run again. It replaces existing memstate
 entries in `settings.json` and does not duplicate them.
 
 ## Connect memstate to your agent
+
+The install script runs `memstate-mcp setup`, which writes the config
+for you (with `node` and the full path of the proxy). To do it by hand:
 
 **Claude Code** (one command):
 
@@ -145,23 +231,20 @@ If you do not want to change PATH, skip `make install` and use
 ### Verify
 
 ```bash
-node client/dist/index.js --test
+memstate-mcp --test
 ```
+
+From a clone without `make install`, run `node client/dist/index.js --test`.
 
 Expected result: the proxy spawns a daemon, prints the daemon address
 and the seven tool names, and exits cleanly.
 
 ## The seven tools
 
-Every tool is scoped by `project_id`. A project is any named subject of
-work: a repository, a product, a topic, a machine. The proxy does not
-derive a project from its working folder, because a folder does not
-always name the work. A session names its project once, with
-`project_name` on its first `memstate_set` or `memstate_remember` call.
-The name can be an existing project id or a new snake_case name. Later
-calls omit `project_id` and use that project. Pass `project_id` only to
-reach a different project. The name lives in the proxy process, so a new
-proxy starts without one. Keypaths use dot notation.
+Every tool is scoped by `project_id`. The proxy derives the default id
+from the git repository name (the directory basename outside a
+repository), slugged to snake_case. Omit `project_id` in tool calls.
+Pass it only to reach a different project. Keypaths use dot notation.
 
 | Tool | Purpose |
 |---|---|
@@ -175,9 +258,10 @@ proxy starts without one. Keypaths use dot notation.
 
 A useful agent loop:
 
-- At task start, call `memstate_get(list_projects=true)`, then `memstate_get(project_id=...)` to load the tree of the project that the work belongs to. The response also carries the user scope under `user`. Call `memstate_search(query=...)` when you do not know the exact keypath.
-- At task end, call `memstate_remember(content="## Summary\n...\n## Decisions\n...", project_name=...)` and let the server extract the sections. The first write of a session names its project; later calls can omit it.
+- At task start, call `memstate_get()` to load the tree. The proxy derives the project id from the repository name. The response also carries the user scope under `user`. Call `memstate_search(query=...)` when you do not know the exact keypath.
+- At task end, call `memstate_remember(content="## Summary\n...\n## Decisions\n...")` and let the server extract the sections.
 - Facts about the user or this machine, not about the code, go to `scope="user"`: `preferences.*`, `profile.*`, `host.<host_slug>.env.*`, `host.<host_slug>.tools.*`. The daemon rejects any other keypath there, so decisions and task summaries cannot leak into a shared store.
+- When the prompt is clearly about another subject than the directory (for example an nginx config asked from the home directory), pin the session once with `project_name`. Prefer an existing id. A new id needs `new_project=true` too and is refused when it looks like an existing one. The recall hook's first-prompt `<memstate-scope>` block shows the cwd project, whether it exists, and the other projects the prompt matches. A write never creates a project unless it targets the git repository you are in or carries `new_project=true`; this covers the cwd project, an explicit `project_id` and a soft-deleted project; a name that resembles an existing project is refused outright, and so is the name of your home directory. Ids that start with `_` are reserved for the user scope. The recall hook follows a session pin through a per-process pin file. From the home directory the proxy refuses writes to the default project altogether: pin a project or use the user scope. The Python scripts apply the same rule with `--new-project`.
 - Never save a denied prompt. A denied prompt is a tool call that the user or a permission check denied.
 
 `node client/dist/index.js init` writes rule files for several agents
@@ -289,7 +373,7 @@ search, but its full version history stays readable.
 | Thing | Path |
 |---|---|
 | SQLite DB | `~/.memstate/memstate.db` (override with `MEMSTATE_DB`, and `~/` is expanded) |
-| Daemon log | `~/.memstate/memstated.log` |
+| Daemon log | `memstated.log` next to the DB (default `~/.memstate/memstated.log`) |
 | Ollama URL | `http://127.0.0.1:11434` (override with `MEMSTATE_OLLAMA_URL` or `--ollama-url`; a URL that ends in `/v1` selects an OpenAI-compatible API) |
 | Embed model | `nomic-embed-text` (override with `MEMSTATE_EMBED_MODEL` or `--embed-model`) |
 | Embed timeout | `60s` per Ollama call (override with `MEMSTATE_EMBED_TIMEOUT` or `--embed-timeout`). Must cover a cold model load: a 4B model needs about 20s on first use. |
@@ -385,24 +469,23 @@ See `client/skill/SKILL.md` for the skill usage contract.
 `make install` links `memstate` to the daemon binary. It reads the SQLite
 file directly and sends writes through the shared daemon, so versioning,
 embeddings and the user-scope rules apply exactly as they do for an agent.
-Each verb needs `--project ID` or `--user`: the CLI does not derive a
-project from the folder you are in.
+The project defaults to the repository you are in.
 
 ```bash
-memstate projects                      # every live project
-memstate tree --project my_app         # keypath tree, plus your user scope
-memstate get decisions --project my_app                 # content under one keypath
-memstate get todo --raw --project my_app | less         # content only
-memstate history config.port --project my_app           # every version, newest first
-memstate search "why sqlite" --limit 5 --project my_app # hybrid search via the daemon
-memstate set config.port 8080 --category config --project my_app
-memstate edit notes.setup --project my_app              # $EDITOR on the current content
-memstate rm branches.old --recursive --project my_app   # asks y/N; --yes to skip
+memstate tree                          # keypath tree for this repo, plus your user scope
+memstate get decisions                 # content under one keypath
+memstate get todo --raw | less         # content only
+memstate history config.port           # every version, newest first
+memstate search "why sqlite" --limit 5 # hybrid search via the daemon
+memstate set config.port 8080 --category config
+memstate edit notes.setup              # $EDITOR on the current content
+memstate rm branches.old --recursive   # asks y/N; --yes to skip
 memstate tree --user                   # preferences, profile, this host's env and tools
-memstate tree --project my_app --json | jq .user        # raw shapes for scripts
+memstate tree --json | jq .user        # raw shapes for scripts
+memstate projects                      # every live project
 ```
 
-`--project ID` names the project, `--user` the reserved user scope,
+`--project ID` reaches another project, `--user` the reserved user scope,
 `--all` (search) the whole store. Flags may follow positionals. Without a
 shared daemon, reads still work and `search` degrades to FTS; `set`, `edit`
 and `rm` tell you how to start one.

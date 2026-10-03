@@ -42,7 +42,7 @@ type cliOpts struct {
 }
 
 func (o *cliOpts) bind(fs *flag.FlagSet) {
-	fs.StringVar(&o.project, "project", "", "project id (required unless --user)")
+	fs.StringVar(&o.project, "project", "", "project id (default: this repo's slug)")
 	fs.BoolVar(&o.user, "user", false, "the reserved user scope (_user)")
 	fs.BoolVar(&o.json, "json", false, "print the raw JSON shape")
 	fs.BoolVar(&o.noColor, "no-color", false, "disable ANSI colors")
@@ -58,10 +58,9 @@ func newVerbFlags(name string) (*flag.FlagSet, *cliOpts) {
 	return fs, o
 }
 
-// resolveCLIProject picks the project for a verb: --user, else --project.
-// It does not derive a project from the working directory, because a folder
-// does not always name the work (the same rule as the proxy and the Python
-// skill).
+// resolveCLIProject picks the project for a verb: --user, else --project,
+// else the repository slug of the working directory (the same rule as the
+// proxy and the Python skill).
 func resolveCLIProject(o cliOpts) (string, error) {
 	if o.user && o.project != "" {
 		return "", errors.New("use --user or --project, not both")
@@ -69,10 +68,14 @@ func resolveCLIProject(o cliOpts) (string, error) {
 	if o.user {
 		return userProject, nil
 	}
-	if o.project == "" {
-		return "", errors.New("pass --project ID or --user (memstate projects lists the ids)")
+	if o.project != "" {
+		return o.project, nil
 	}
-	return o.project, nil
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+	return deriveProject(cwd), nil
 }
 
 // parseInterspersed lets flags follow positionals ("get todo --json").

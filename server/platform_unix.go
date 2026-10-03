@@ -19,6 +19,13 @@ func detachSysProcAttr() *syscall.SysProcAttr {
 	return &syscall.SysProcAttr{Setsid: true}
 }
 
+// processAlive reports whether pid exists. EPERM means it exists but
+// belongs to another user, which still counts as alive.
+func processAlive(pid int) bool {
+	err := syscall.Kill(pid, 0)
+	return err == nil || errors.Is(err, syscall.EPERM)
+}
+
 // watchOwner polls the parent PID and triggers shutdown when it vanishes.
 // Signal 0 is the canonical Unix "does this pid exist AND can I signal it"
 // probe; ESRCH means the owner is gone.

@@ -2,11 +2,12 @@
 """Browse and retrieve memories from the memstated daemon.
 
 Usage:
-  memstate_get.py --list-projects                    # List all project ids
-  memstate_get.py --project my_app                   # Project tree plus the user scope (names only)
-  memstate_get.py --project my_app --keypath db --include-content  # Subtree with content
+  memstate_get.py                                    # This repo's tree plus the user scope (names only)
   memstate_get.py --scope user                       # The user scope tree, pruned to this host
+  memstate_get.py --list-projects                    # List all project ids
+  memstate_get.py --keypath db --include-content    # Subtree with content
   memstate_get.py --scope user --keypath preferences # User-scope subtree with content
+  memstate_get.py --project other_app --keypath db  # Another project's subtree
   memstate_get.py --memory-id 42                     # Single memory by numeric ID
 """
 import argparse
@@ -15,7 +16,8 @@ import urllib.error
 import urllib.parse
 
 from _client import (USER_PROJECT, add_scope_args, count_values, emit, fetch,
-                     get, host_slug, prune_other_hosts, resolve_project)
+                     get, host_slug, list_projects_visible, prune_other_hosts,
+                     resolve_project)
 
 
 def _tree(project: str) -> dict:
@@ -45,7 +47,7 @@ def main() -> int:
     args = ap.parse_args()
 
     if args.list_projects:
-        return get("/projects")
+        return emit(list_projects_visible)
 
     if args.memory_id is not None:
         return get(f"/memories/{args.memory_id}")

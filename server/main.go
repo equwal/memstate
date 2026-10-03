@@ -43,7 +43,7 @@ import (
 const (
 	defaultAddr       = "127.0.0.1:8765" // used only in --addr / stop / status
 	healthServiceName = "memstate"
-	healthVersion     = "0.7.4"
+	healthVersion     = "0.7.8"
 	readyBanner       = "MEMSTATE_READY addr="
 )
 
@@ -64,6 +64,13 @@ func defaultDBPath() string {
 // is private to the parent that spawned them.
 func addrFilePath() string {
 	return filepath.Join(filepath.Dir(defaultDBPath()), "daemon.addr")
+}
+
+// daemonLogPath is the daemon log, next to the database. The MCP proxy
+// (openDaemonLog) and the Python scripts (_spawn_child) use the same rule, so
+// a daemon on a test database does not write to the log of the user's daemon.
+func daemonLogPath() string {
+	return filepath.Join(filepath.Dir(defaultDBPath()), "memstated.log")
 }
 
 // writeAddrFile records addr atomically (temp file + rename).

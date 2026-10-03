@@ -22,6 +22,24 @@ func detachSysProcAttr() *syscall.SysProcAttr {
 	return &syscall.SysProcAttr{CreationFlags: 0x00000008 | 0x00000200}
 }
 
+// stillActive is what GetExitCodeProcess reports for a running process
+// (STILL_ACTIVE, 0x103). x/sys/windows does not define it.
+const stillActive = 259
+
+// processAlive reports whether pid is a running process.
+func processAlive(pid int) bool {
+	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(pid))
+	if err != nil {
+		return false
+	}
+	defer windows.CloseHandle(h)
+	var code uint32
+	if err := windows.GetExitCodeProcess(h, &code); err != nil {
+		return true
+	}
+	return code == stillActive
+}
+
 // watchOwner blocks on the parent process handle and triggers shutdown when
 // it exits — Windows' equivalent of the Unix kill(pid, 0) poll.
 func watchOwner(pid int, shutdown func()) {

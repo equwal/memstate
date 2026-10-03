@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -12,82 +15,90 @@ import (
 	"pgregory.net/rapid"
 )
 
+func TestSlugProjectProperties(t *testing.T) {
+	valid := regexp.MustCompile(`^[a-z0-9_]+$`)
+	rapid.Check(t, func(t *rapid.T) {
+		name := rapid.String().Draw(t, "name")
+		s := slugProject(name)
+		if !valid.MatchString(s) {
+			t.Fatalf("slug %q of %q has characters outside [a-z0-9_]", s, name)
+		}
+		if strings.HasPrefix(s, "_") || strings.HasSuffix(s, "_") {
+			t.Fatalf("slug %q of %q has an edge underscore", s, name)
+		}
+		if again := slugProject(s); again != s {
+			t.Fatalf("slug is not idempotent: %q -> %q", s, again)
+		}
+	})
+}
+
+func TestDeriveProject(t *testing.T) {
+	// Non-repository directory: its own name, slugged.
+	plain := filepath.Join(t.TempDir(), "My-App v2")
+	if err := os.Mkdir(plain, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := deriveProject(plain); got != "my_app_v2" {
+		t.Fatalf("plain dir: got %q want my_app_v2", got)
+	}
+	if got := deriveProject(""); got != "default" {
+		t.Fatalf("empty cwd: got %q want default", got)
+	}
+
+	// Repository: the top-level name wins even from a nested directory.
+	repo := filepath.Join(t.TempDir(), "Repo.Name")
+	nested := filepath.Join(repo, "sub", "dir")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "-C", repo, "init", "-q").CombinedOutput(); err != nil {
+		t.Skipf("git init unavailable: %v %s", err, out)
+	}
+	if got := deriveProject(nested); got != "repo_name" {
+		t.Fatalf("nested repo dir: got %q want repo_name", got)
+	}
+}
+
 func TestRenderRecall(t *testing.T) {
 	long := strings.Repeat("x", 600)
 	fts, both := []string{"fts"}, []string{"fts", "semantic"}
 	hits := []recallHit{
-		{ProjectID: "p", Keypath: "a", Content: "seen already", Sources: both},
-		{ProjectID: "p", Keypath: "b", Content: long, Category: "gotcha", Sources: fts},
-		{ProjectID: "q", Keypath: "c", Content: "  short  ", Sources: fts},
-		{ProjectID: "p", Keypath: "d", Content: "fourth", Sources: both},
-		{ProjectID: "p", Keypath: "e", Content: "fifth", Sources: both},
+		{Keypath: "a", Content: "seen already", Sources: both},
+		{Keypath: "b", Content: long, Category: "gotcha", Sources: fts},
+		{Keypath: "c", Content: "  short  ", Sources: fts},
+		{Keypath: "d", Content: "fourth", Sources: both},
+		{Keypath: "e", Content: "fifth", Sources: both},
 	}
-	seen := map[string]bool{"p:a": true}
-	text, shown := renderRecall(hits, seen, 3, 500)
-	if want := "p:b,q:c,p:d"; strings.Join(shown, ",") != want {
+	text, shown := renderRecall("proj", hits, nil, map[string]bool{"a": true}, 3, 500)
+	if want := []string{"b", "c", "d"}; strings.Join(shown, ",") != strings.Join(want, ",") {
 		t.Fatalf("shown = %v want %v", shown, want)
 	}
 	// A hit below the cap fills a freed slot only with a semantic source.
 	hits[3].Sources = fts
-	if _, shown := renderRecall(hits, seen, 3, 500); strings.Join(shown, ",") != "p:b,q:c,p:e" {
+	if _, shown := renderRecall("proj", hits, nil, map[string]bool{"a": true}, 3, 500); strings.Join(shown, ",") != "b,c,e" {
 		t.Fatalf("fts-only backfill must be skipped, semantic backfill taken: shown = %v", shown)
 	}
 	hits[4].Sources = fts
-	if _, shown := renderRecall(hits, seen, 3, 500); strings.Join(shown, ",") != "p:b,q:c" {
+	if _, shown := renderRecall("proj", hits, nil, map[string]bool{"a": true}, 3, 500); strings.Join(shown, ",") != "b,c" {
 		t.Fatalf("no semantic candidates below the cap: shown = %v", shown)
 	}
 	hits[3].Sources = both
-	if !strings.HasPrefix(text, "<memstate-recall>\n") ||
+	if !strings.HasPrefix(text, "<memstate-recall project=\"proj\">\n") ||
 		!strings.HasSuffix(text, "</memstate-recall>\n") {
 		t.Fatalf("block markers missing:\n%s", text)
 	}
 	if strings.Contains(text, "seen already") || strings.Contains(text, "fifth") {
 		t.Fatalf("seen or over-cap hit leaked:\n%s", text)
 	}
-	if !strings.Contains(text, "### p:b [gotcha]\n"+strings.Repeat("x", 500)+"[…truncated]\n") {
+	if !strings.Contains(text, "### b [gotcha]\n"+strings.Repeat("x", 500)+"[…truncated]\n") {
 		t.Fatalf("truncation or category header wrong:\n%s", text)
 	}
-	if !strings.Contains(text, "### q:c\nshort\n") {
+	if !strings.Contains(text, "### c\nshort\n") {
 		t.Fatalf("content should be trimmed:\n%s", text)
 	}
-	// The same keypath in another project is a different memory.
-	if _, shown := renderRecall([]recallHit{{ProjectID: "q", Keypath: "a", Sources: both}}, seen, 3, 500); strings.Join(shown, ",") != "q:a" {
-		t.Fatalf("a seen keypath of one project must not hide another project's: shown = %v", shown)
-	}
-	if text, shown := renderRecall(hits[:1], seen, 3, 500); text != "" || shown != nil {
+	if text, shown := renderRecall("proj", hits[:1], nil, map[string]bool{"a": true}, 3, 500); text != "" || shown != nil {
 		t.Fatalf("all-seen must render nothing, got %q %v", text, shown)
 	}
-}
-
-func TestRenderRecallProperties(t *testing.T) {
-	rapid.Check(t, func(t *rapid.T) {
-		id := rapid.StringMatching(`[a-c]`)
-		hits := rapid.SliceOf(rapid.Custom(func(t *rapid.T) recallHit {
-			return recallHit{
-				ProjectID: id.Draw(t, "project"),
-				Keypath:   id.Draw(t, "keypath"),
-				Content:   rapid.String().Draw(t, "content"),
-				Sources:   rapid.SampledFrom([][]string{{"fts"}, {"fts", "semantic"}}).Draw(t, "sources"),
-			}
-		})).Draw(t, "hits")
-		seen := map[string]bool{}
-		for _, key := range rapid.SliceOf(rapid.StringMatching(`[a-c]:[a-c]`)).Draw(t, "seen") {
-			seen[key] = true
-		}
-		maxHits := rapid.IntRange(1, 5).Draw(t, "maxHits")
-		text, shown := renderRecall(hits, seen, maxHits, 50)
-		if len(shown) > maxHits {
-			t.Fatalf("shown %d hits, cap is %d", len(shown), maxHits)
-		}
-		if (text == "") != (len(shown) == 0) {
-			t.Fatalf("text and shown disagree: %q %v", text, shown)
-		}
-		for _, key := range shown {
-			if seen[key] {
-				t.Fatalf("seen key %q shown again", key)
-			}
-		}
-	})
 }
 
 func TestRunRecallEndToEnd(t *testing.T) {
@@ -98,18 +109,13 @@ func TestRunRecallEndToEnd(t *testing.T) {
 	ts := newTestServer(t)
 	t.Setenv("MEMSTATE_ADDR", strings.TrimPrefix(ts.URL, "http://"))
 
-	// The folder name matches no project: recall must not depend on it.
-	cwd := filepath.Join(t.TempDir(), "unrelated-folder")
+	cwd := filepath.Join(t.TempDir(), "recall-proj")
 	if err := os.Mkdir(cwd, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	postJSON(t, ts.URL+"/api/v1/memories/remember", map[string]any{
 		"project_id": "recall_proj", "keypath": "gotchas.timeout",
 		"content": "the embed timeout must cover a cold model load", "category": "gotcha",
-	})
-	postJSON(t, ts.URL+"/api/v1/memories/remember", map[string]any{
-		"project_id": "other_proj", "keypath": "notes.cold",
-		"content": "a cold model load takes a long embed timeout",
 	})
 
 	run := func(event string) string {
@@ -123,10 +129,9 @@ func TestRunRecallEndToEnd(t *testing.T) {
 		`,"prompt":"why does the embed timeout matter for cold loads"}`
 
 	first := run(event)
-	if !strings.Contains(first, "<memstate-recall>") ||
-		!strings.Contains(first, "### recall_proj:gotchas.timeout [gotcha]") ||
-		!strings.Contains(first, "### other_proj:notes.cold") {
-		t.Fatalf("first prompt should inject the hits of both projects, got:\n%s", first)
+	if !strings.Contains(first, `<memstate-recall project="recall_proj">`) ||
+		!strings.Contains(first, "### gotchas.timeout [gotcha]") {
+		t.Fatalf("first prompt should inject the hit, got:\n%s", first)
 	}
 	if second := run(event); second != "" {
 		t.Fatalf("same session must not repeat a keypath, got:\n%s", second)
@@ -175,53 +180,51 @@ func jsonString(s string) string {
 
 func TestRenderRecallUserScope(t *testing.T) {
 	both := []string{"fts", "semantic"}
-	// The user hits rank first, so a fixed slot, not rank, gives them room.
 	hits := []recallHit{
-		{ProjectID: userProject, Keypath: "preferences.commit_style", Content: "no trailers", Category: "config", Sources: both},
-		{ProjectID: userProject, Keypath: "profile.role", Content: "backend", Sources: both},
-		{ProjectID: "p", Keypath: "p1", Content: "project one", Sources: both},
-		{ProjectID: "q", Keypath: "p2", Content: "project two", Sources: both},
-		{ProjectID: "p", Keypath: "p3", Content: "project three", Sources: both},
+		{Keypath: "p1", Content: "project one", Sources: both},
+		{Keypath: "p2", Content: "project two", Sources: both},
+		{Keypath: "p3", Content: "project three", Sources: both},
 	}
-	text, shown := renderRecall(hits, map[string]bool{}, 3, 500)
-	// One slot goes to the user scope, the rest to the other projects.
-	if want := "p:p1,q:p2,_user:preferences.commit_style"; strings.Join(shown, ",") != want {
+	user := []recallHit{
+		{Keypath: "preferences.commit_style", Content: "no trailers", Category: "config", Sources: both},
+		{Keypath: "profile.role", Content: "backend", Sources: both},
+	}
+	text, shown := renderRecall("proj", hits, user, map[string]bool{}, 3, 500)
+	// One slot goes to the user scope, the rest to the project.
+	if want := "p1,p2,_user/preferences.commit_style"; strings.Join(shown, ",") != want {
 		t.Fatalf("shown = %v want %s", shown, want)
 	}
-	if !strings.Contains(text, "### _user:preferences.commit_style [user] [config]\nno trailers\n") {
+	if !strings.Contains(text, "### preferences.commit_style [user] [config]\nno trailers\n") {
 		t.Fatalf("user hit marker missing:\n%s", text)
 	}
 	if strings.Contains(text, "profile.role") || strings.Contains(text, "project three") {
 		t.Fatalf("second user hit or fourth hit leaked:\n%s", text)
 	}
 	// A seen user hit frees its slot for the next user hit.
-	seen := map[string]bool{"_user:preferences.commit_style": true}
-	if _, shown := renderRecall(hits, seen, 3, 500); strings.Join(shown, ",") != "p:p1,q:p2,_user:profile.role" {
+	seen := map[string]bool{"_user/preferences.commit_style": true}
+	if _, shown := renderRecall("proj", hits, user, seen, 3, 500); strings.Join(shown, ",") != "p1,p2,_user/profile.role" {
 		t.Fatalf("shown = %v", shown)
 	}
 	// A project keypath equal to a user keypath is not suppressed by it.
-	seen = map[string]bool{"p:preferences.commit_style": true}
-	if _, shown := renderRecall(hits, seen, 3, 500); strings.Join(shown, ",") != "p:p1,q:p2,_user:preferences.commit_style" {
+	seen = map[string]bool{"preferences.commit_style": true}
+	if _, shown := renderRecall("proj", hits, user, seen, 3, 500); strings.Join(shown, ",") != "p1,p2,_user/preferences.commit_style" {
 		t.Fatalf("seen keys must be scoped: shown = %v", shown)
 	}
 	// User hits alone still render.
-	if text, _ := renderRecall(hits[:2], map[string]bool{}, 3, 500); !strings.Contains(text, "### _user:preferences.commit_style [user]") {
+	if text, _ := renderRecall("proj", nil, user, map[string]bool{}, 3, 500); !strings.Contains(text, "### preferences.commit_style [user]") {
 		t.Fatalf("user-only render:\n%s", text)
 	}
 }
 
 func TestFilterHostHits(t *testing.T) {
 	hits := []recallHit{
-		{ProjectID: userProject, Keypath: "preferences.x"},
-		{ProjectID: userProject, Keypath: "host.mbp.env.go_bin"},
-		{ProjectID: userProject, Keypath: "host.other.env.go_bin"},
-		{ProjectID: userProject, Keypath: "host"},
-		// A keypath of another project that looks like a host path stays.
-		{ProjectID: "p", Keypath: "host.other.env.go_bin"},
+		{Keypath: "preferences.x"},
+		{Keypath: "host.mbp.env.go_bin"},
+		{Keypath: "host.other.env.go_bin"},
+		{Keypath: "host"},
 	}
 	got := filterHostHits(hits, "mbp")
-	if len(got) != 4 || got[0].Keypath != "preferences.x" || got[1].Keypath != "host.mbp.env.go_bin" ||
-		got[2].Keypath != "host" || got[3].ProjectID != "p" {
+	if len(got) != 3 || got[0].Keypath != "preferences.x" || got[1].Keypath != "host.mbp.env.go_bin" || got[2].Keypath != "host" {
 		t.Fatalf("got %+v", got)
 	}
 }
@@ -265,5 +268,260 @@ func TestRunRecallUserScope(t *testing.T) {
 	}
 	if strings.Count(text, "[user]") != 1 {
 		t.Fatalf("more than one user slot:\n%s", text)
+	}
+}
+
+func TestProjectCandidates(t *testing.T) {
+	sem, fts := []string{"fts", "semantic"}, []string{"fts"}
+	hits := []recallHit{
+		{ProjectID: "cwd_proj", Keypath: "a", Sources: sem},
+		{ProjectID: "_user", Keypath: "preferences.x", Sources: sem},
+		{ProjectID: "nginx_server", Keypath: "a", Sources: fts},
+		{ProjectID: "nginx_server", Keypath: "b", Sources: fts},
+		{ProjectID: "weak", Keypath: "a", Sources: fts},
+		{ProjectID: "infra", Keypath: "a", Sources: sem},
+		{ProjectID: "big", Keypath: "a", Sources: fts},
+		{ProjectID: "big", Keypath: "b", Sources: fts},
+		{ProjectID: "big", Keypath: "c", Sources: fts},
+		{ProjectID: "also", Keypath: "a", Sources: sem},
+		{ProjectID: "also", Keypath: "b", Sources: sem},
+	}
+	got := projectCandidates(hits, "cwd_proj")
+	ids := make([]string, len(got))
+	for i, c := range got {
+		ids[i] = c.ProjectID
+	}
+	// Only semantic hits count: cwd and _user dropped; nginx_server, weak
+	// and big are FTS-only word matches and vanish; also (2) ranks above
+	// infra (1).
+	if want := "also,infra"; strings.Join(ids, ",") != want {
+		t.Fatalf("candidates %v want %s", ids, want)
+	}
+	if got[0].Hits != 2 || got[1].Hits != 1 {
+		t.Fatalf("candidate detail: %+v", got)
+	}
+	// Top three by count, ties by name.
+	many := []recallHit{
+		{ProjectID: "c", Keypath: "a", Sources: sem},
+		{ProjectID: "b", Keypath: "a", Sources: sem},
+		{ProjectID: "a", Keypath: "a", Sources: sem},
+		{ProjectID: "d", Keypath: "a", Sources: sem},
+		{ProjectID: "d", Keypath: "b", Sources: sem},
+	}
+	got = projectCandidates(many, "cwd_proj")
+	ids = ids[:0]
+	for _, c := range got {
+		ids = append(ids, c.ProjectID)
+	}
+	if want := "d,a,b"; strings.Join(ids, ",") != want {
+		t.Fatalf("top three %v want %s", ids, want)
+	}
+}
+
+func TestScopeBlockText(t *testing.T) {
+	plain := t.TempDir()
+	text := scopeBlock("scratch", plain, false, nil)
+	if !strings.HasPrefix(text, "<memstate-scope cwd_project=\"scratch\" exists=\"false\">\n") ||
+		!strings.Contains(text, "is not a git repository ("+filepath.Base(plain)+")") ||
+		!strings.Contains(text, `Project "scratch" does not exist yet; a write creates it only with new_project=true.`) ||
+		!strings.Contains(text, "matches no other project") ||
+		!strings.Contains(text, "Default is the cwd project.") ||
+		!strings.HasSuffix(text, "</memstate-scope>\n") {
+		t.Fatalf("plain dir block:\n%s", text)
+	}
+	// An existing project gets the attribute and no creation sentence.
+	text = scopeBlock("scratch", plain, true, nil)
+	if !strings.HasPrefix(text, "<memstate-scope cwd_project=\"scratch\" exists=\"true\">\n") ||
+		strings.Contains(text, "does not exist yet") {
+		t.Fatalf("existing project block:\n%s", text)
+	}
+	// The home directory never has a default project for writes. Skipped
+	// when the home directory itself is a git repository.
+	if home, err := os.UserHomeDir(); err == nil {
+		if _, isRepo := repoRoot(home); !isRepo {
+			got := scopeBlock("me", home, true, nil)
+			// The rule sentence must not contradict the line above it, and
+			// exists= is noise where no write can land.
+			if !strings.HasPrefix(got, "<memstate-scope cwd_project=\"me\">\n") ||
+				strings.Contains(got, "exists=") ||
+				!strings.Contains(got, "(home directory)") ||
+				!strings.Contains(got, "no default project for writes") ||
+				!strings.Contains(got, "Every write needs project_name") ||
+				!strings.Contains(got, `scope="user"`) ||
+				strings.Contains(got, "Default is the cwd project") {
+				t.Fatalf("home block:\n%s", got)
+			}
+		}
+	}
+	cands := []projectCandidate{{"nginx_server", 3}, {"infra", 2}, {"one", 1}}
+	text = scopeBlock("me", plain, true, cands)
+	if !strings.Contains(text, "Prompt matches other projects: nginx_server (3 semantic hits), infra (2 semantic hits), one (1 semantic hit).") {
+		t.Fatalf("candidates line:\n%s", text)
+	}
+
+	repo := filepath.Join(t.TempDir(), "Repo.Name")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "-C", repo, "init", "-q").CombinedOutput(); err != nil {
+		t.Skipf("git init unavailable: %v %s", err, out)
+	}
+	if got := scopeBlock("repo_name", repo, true, nil); !strings.Contains(got, "is the git repository Repo.Name.") {
+		t.Fatalf("repo block:\n%s", got)
+	}
+}
+
+func TestScopeBlockFirstPromptOnly(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("MEMSTATE_DB", filepath.Join(dir, "t.db"))
+	t.Setenv("MEMSTATE_NO_RECALL", "")
+	ts := newTestServer(t)
+	t.Setenv("MEMSTATE_ADDR", strings.TrimPrefix(ts.URL, "http://"))
+
+	cwd := filepath.Join(t.TempDir(), "scratch")
+	if err := os.Mkdir(cwd, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	seed := func(project, kp, content string) {
+		t.Helper()
+		code, out := postJSON(t, ts.URL+"/api/v1/memories/store", map[string]any{
+			"project_id": project, "keypath": kp, "content": content,
+		})
+		if code != 200 {
+			t.Fatalf("seed: %d %v", code, out)
+		}
+	}
+	seed("nginx_server", "config.sites", "the nginx config for the sites lives in sites-enabled")
+	seed("nginx_server", "config.tls", "nginx config uses certbot for tls")
+	seed("scratch", "notes.x", "the nginx config note in the scratch project")
+	seed("lonely", "notes.y", "one nginx config mention only")
+
+	run := func(session, prompt string) string {
+		var out bytes.Buffer
+		event := `{"session_id":` + jsonString(session) + `,"cwd":` + jsonString(cwd) +
+			`,"prompt":` + jsonString(prompt) + `}`
+		if code := runRecall(strings.NewReader(event), &out); code != 0 {
+			t.Fatalf("exit %d", code)
+		}
+		return out.String()
+	}
+	// No embedder here: every hit is an FTS word match, so no project
+	// qualifies as a candidate, however many words it shares.
+	first := run("sc1", "help me set up my nginx config")
+	if !strings.Contains(first, `<memstate-scope cwd_project="scratch" exists="true">`) ||
+		!strings.Contains(first, "Prompt matches no other project.") ||
+		strings.Contains(first, "nginx_server (") ||
+		!strings.Contains(first, `<memstate-recall project="scratch">`) {
+		t.Fatalf("first prompt:\n%s", first)
+	}
+	if strings.Index(first, "<memstate-scope") > strings.Index(first, "<memstate-recall") {
+		t.Fatalf("scope block must come first:\n%s", first)
+	}
+	second := run("sc1", "more about the nginx config please")
+	if strings.Contains(second, "<memstate-scope") {
+		t.Fatalf("scope block repeated in the same session:\n%s", second)
+	}
+	if again := run("sc2", "help me set up my nginx config"); !strings.Contains(again, "<memstate-scope") {
+		t.Fatalf("a new session must get the scope block:\n%s", again)
+	}
+	seen := loadSeen(recallSeenPath("sc1"))
+	if !seen[scopeMarker] || !seen["notes.x"] {
+		t.Fatalf("seen file: %v", seen)
+	}
+	// A cwd whose project has no memories still gets the block.
+	empty := filepath.Join(t.TempDir(), "nothing_here")
+	if err := os.Mkdir(empty, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	event := `{"session_id":"sc3","cwd":` + jsonString(empty) + `,"prompt":"help me set up my nginx config"}`
+	runRecall(strings.NewReader(event), &out)
+	if !strings.Contains(out.String(), `<memstate-scope cwd_project="nothing_here" exists="false">`) ||
+		strings.Contains(out.String(), "<memstate-recall") {
+		t.Fatalf("empty project first prompt:\n%s", out.String())
+	}
+}
+
+func TestScopeBlockSemanticCandidates(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("MEMSTATE_DB", filepath.Join(dir, "t.db"))
+	t.Setenv("MEMSTATE_NO_RECALL", "")
+	ollama := mockOllama(t)
+	defer ollama.Close()
+	embedder := newTestEmbedder(t, ollama)
+	ts := newTestServerWithEmbedder(t, embedder)
+	t.Setenv("MEMSTATE_ADDR", strings.TrimPrefix(ts.URL, "http://"))
+	// The mock embedder puts every text near every other, so each hit
+	// carries a semantic source: this checks the plumbing from the
+	// all-projects search into the block, not the ranking quality.
+	t.Setenv("MEMSTATE_SEMANTIC_THRESHOLD", "0")
+
+	cwd := filepath.Join(t.TempDir(), "scratch")
+	if err := os.Mkdir(cwd, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range [][2]string{
+		{"nginx_server", "config.sites"}, {"nginx_server", "config.tls"}, {"lonely", "notes.y"},
+	} {
+		postJSON(t, ts.URL+"/api/v1/memories/store", map[string]any{
+			"project_id": s[0], "keypath": s[1], "content": "nginx config " + s[1],
+		})
+	}
+	embedder.WaitForPending()
+
+	var out bytes.Buffer
+	event := `{"session_id":"sem1","cwd":` + jsonString(cwd) + `,"prompt":"help me set up my nginx config"}`
+	if code := runRecall(strings.NewReader(event), &out); code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+	text := out.String()
+	if !strings.Contains(text, "Prompt matches other projects: nginx_server (2 semantic hits), lonely (1 semantic hit).") {
+		t.Fatalf("semantic candidates:\n%s", text)
+	}
+}
+
+func TestPinnedProject(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("MEMSTATE_DB", filepath.Join(dir, "t.db"))
+	cwd := filepath.Join(dir, "work")
+	if err := os.Mkdir(cwd, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := pinnedProject(cwd); got != "" {
+		t.Fatalf("no pins dir: got %q", got)
+	}
+	pins := filepath.Join(dir, "recall", "pins")
+	if err := os.MkdirAll(pins, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write := func(name, content string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(pins, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A live proxy (this test process) pinned another directory: ignored.
+	write(strconv.Itoa(os.Getpid()), filepath.Join(dir, "elsewhere")+"\nother\n")
+	if got := pinnedProject(cwd); got != "" {
+		t.Fatalf("other cwd: got %q", got)
+	}
+	// A dead proxy pinned this directory: ignored and pruned.
+	write("999999999", cwd+"\ndead_pin\n")
+	if got := pinnedProject(cwd); got != "" {
+		t.Fatalf("dead pid: got %q", got)
+	}
+	if _, err := os.Stat(filepath.Join(pins, "999999999")); !os.IsNotExist(err) {
+		t.Fatalf("dead pin file not pruned: %v", err)
+	}
+	// A live proxy pinned this directory: that project wins.
+	write(strconv.Itoa(os.Getpid()), cwd+"\nnginx_server\n")
+	if got := pinnedProject(cwd); got != "nginx_server" {
+		t.Fatalf("live pin: got %q", got)
+	}
+	// Garbage in the directory never breaks the hook.
+	write("notapid", "junk")
+	write(strconv.Itoa(os.Getpid()), "")
+	if got := pinnedProject(cwd); got != "" {
+		t.Fatalf("garbage: got %q", got)
 	}
 }

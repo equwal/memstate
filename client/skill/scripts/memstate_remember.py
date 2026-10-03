@@ -17,12 +17,13 @@ Server response (both modes): { method, items: [{keypath, action, stored, supers
 import argparse
 import sys
 
-from _client import add_scope_args, post, resolve_project
+from _client import add_scope_args, add_write_args, check_write_target, post, resolve_project
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Save a markdown summary")
     add_scope_args(ap)
+    add_write_args(ap)
     ap.add_argument("--keypath", default=None,
                     help="optional — omit to extract keypaths from ## headings")
     ap.add_argument("--content", required=True)
@@ -35,8 +36,10 @@ def main() -> int:
                     help="comma-separated tags applied to every written section")
     args = ap.parse_args()
 
+    project = resolve_project(args)
+    check_write_target(args, project)
     body = {
-        "project_id": resolve_project(args),
+        "project_id": project,
         "content": args.content,
     }
     if args.keypath:

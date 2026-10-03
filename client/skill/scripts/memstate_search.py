@@ -28,7 +28,7 @@ def main() -> int:
     ap.add_argument("--query", required=True)
     add_scope_args(ap)
     ap.add_argument("--all-projects", action="store_true",
-                    help="search every project instead of one")
+                    help="search every project instead of just this repo's")
     ap.add_argument("--limit", type=int, default=20)
     ap.add_argument("--mode", choices=("hybrid", "fts", "semantic"), default="hybrid")
     ap.add_argument("--threshold", type=float, default=None,

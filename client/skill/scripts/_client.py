@@ -15,6 +15,7 @@ Env:
   MEMSTATE_ADDR       attach to this host:port (attach mode)
   MEMSTATE_BIN        override the daemon path (default: sibling build / PATH)
   MEMSTATE_LOCAL_URL  full base URL override (for both modes)
+  MEMSTATE_DB         the child's DB; the daemon log goes in the same directory
 """
 import atexit
 import json
@@ -44,17 +45,30 @@ def _resolve_bin() -> str:
     if explicit and Path(explicit).exists():
         return explicit
     # scripts/ → client/skill/scripts/ → ../../../server/memstated
-    sibling = (Path(__file__).resolve().parent / ".." / ".." / ".." / "server" / "memstated").resolve()
+    binary = "memstated.exe" if os.name == "nt" else "memstated"
+    sibling = (Path(__file__).resolve().parent / ".." / ".." / ".." / "server" / binary).resolve()
     if sibling.exists():
         return str(sibling)
     return "memstated"  # fall through to PATH
+
+
+def _memstate_dir() -> Path:
+    """The directory of the DB. Mirrors memstateDir in the TS proxy."""
+    db = os.environ.get("MEMSTATE_DB")
+    if db:
+        if db.startswith("~/"):
+            db = str(Path.home() / db[2:])
+        return Path(db).resolve().parent
+    return Path.home() / ".memstate"
 
 
 def _spawn_child() -> str:
     """Spawn memstated, read banner, wire atexit cleanup. Returns addr."""
     global _child
     bin_path = _resolve_bin()
-    log_path = Path.home() / ".memstate" / "memstated.log"
+    # The daemon log is next to the DB, so a daemon on a test DB does not
+    # write to the log of the user's daemon.
+    log_path = _memstate_dir() / "memstated.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_fd = open(log_path, "a")
 
@@ -206,14 +220,40 @@ def emit(call) -> int:
         return 2
 
 
-def require_project(project: Optional[str]) -> str:
-    """Return the --project value, or exit with a hint. The scripts do not
-    derive a project from the working folder, because a folder does not
-    always name the work."""
-    if not project:
-        sys.exit("Error: pass --project ID "
-                 "(memstate_get.py --list-projects shows the ids)")
-    return project
+def _cwd_base():
+    """(name, in_repo): the git top-level directory name when the cwd is
+    inside a repository, else the cwd name."""
+    try:
+        top = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if top.returncode == 0 and top.stdout.strip():
+            return Path(top.stdout.strip()).name, True
+    except Exception:
+        pass
+    return Path.cwd().name, False
+
+
+def default_project() -> str:
+    """Project id derived from the git repo name (or cwd basename outside a
+    repo), slugged to lowercase snake_case — same rule as the TS proxy, so
+    scripts and MCP sessions land in the same project."""
+    return slug_name(_cwd_base()[0])
+
+
+def in_git_repo() -> bool:
+    """True when the cwd is inside a git repository: its name is intent."""
+    return _cwd_base()[1]
+
+
+def is_home_dir() -> bool:
+    """True when the cwd is the home directory, which names the user, not a
+    project."""
+    try:
+        return Path.cwd().resolve() == Path.home().resolve()
+    except Exception:
+        return False
 
 
 def slug_name(name: str) -> str:
@@ -238,21 +278,153 @@ def host_slug() -> str:
 def add_scope_args(ap) -> None:
     """Add the --project / --scope pair every script accepts."""
     ap.add_argument("--project", default=None,
-                    help="project id (required unless --scope user: the "
-                         "scripts do not derive one)")
+                    help="project id (default: the cwd project, derived from the git "
+                         "repository or directory name; ids that start with _ are reserved)")
     ap.add_argument("--scope", choices=("project", "user"), default="project",
                     help="'user' targets the reserved user scope (facts about "
-                         "the user or this machine, not about one project)")
+                         "the user or this machine, not about this repo)")
 
 
 def resolve_project(args) -> str:
     """Project id for a call: the reserved user project for --scope user,
-    else --project, which is then required."""
+    else --project, else this repo's default."""
     if args.scope == "user":
         if args.project:
             raise SystemExit("Error: pass --scope user or --project, not both")
         return USER_PROJECT
-    return require_project(args.project)
+    if args.project and is_reserved_id(args.project):
+        raise SystemExit(
+            f'Error: project ids that start with "_" are reserved ("{args.project}"); '
+            "use --scope user for the user scope")
+    return args.project or default_project()
+
+
+def is_reserved_id(pid: str) -> bool:
+    """Reserved ids start with "_". The daemon lists _user among the
+    projects, but for scripts it is --scope user, never --project."""
+    return pid.startswith("_")
+
+
+def home_slug_name() -> str:
+    """The project id the home directory would derive. It names the user,
+    not a project, so writes never accept it."""
+    return slug_name(Path.home().name)
+
+
+def list_projects_visible() -> dict:
+    """The daemon's project list without reserved ids."""
+    out = fetch("GET", "/projects")
+    if isinstance(out, dict):
+        out = dict(out)
+        out["projects"] = [p for p in (out.get("projects") or []) if not is_reserved_id(p["id"])]
+    return out
+
+
+def add_write_args(ap) -> None:
+    """Add --new-project, which the two write scripts accept."""
+    ap.add_argument("--new-project", action="store_true",
+                    help="allow this write to create a project that does not exist "
+                         "yet (the git repository you are in never needs it)")
+
+
+# The near-duplicate rule folds the spellings that split one project into
+# several: underscores, digits, a trailing dev/test/tmp/old/new, one id
+# containing the other, or a small edit distance. Same rule as the TS proxy.
+def normalize_id(pid: str) -> str:
+    s = pid.replace("_", "")
+    s = re.sub(r"[0-9]", "", s)
+    return re.sub(r"(dev|test|tests|tmp|old|new)$", "", s)
+
+
+def levenshtein(a: str, b: str) -> int:
+    prev = list(range(len(b) + 1))
+    for i in range(1, len(a) + 1):
+        cur = [i] + [0] * len(b)
+        for j in range(1, len(b) + 1):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+        prev = cur
+    return prev[len(b)]
+
+
+def near_duplicates(name: str, ids: list) -> list:
+    """Existing ids that name looks like."""
+    n = normalize_id(name)
+    out = []
+    for pid in ids:
+        if pid == name:
+            continue
+        m = normalize_id(pid)
+        if n == m or (len(n) >= 4 and len(m) >= 4 and (n in m or m in n)):
+            out.append(pid)
+            continue
+        limit = 1 if min(len(n), len(m)) < 6 else 2
+        if levenshtein(n, m) <= limit:
+            out.append(pid)
+    return out
+
+
+def list_project_ids() -> list:
+    """Live project ids from the daemon. Exits 2 when it is unreachable."""
+    try:
+        out = fetch("GET", "/projects")
+    except urllib.error.URLError as e:
+        print(f"Error: could not reach memstated at {_base_url}: {e.reason}", file=sys.stderr)
+        raise SystemExit(2)
+    projects = out.get("projects") if isinstance(out, dict) else None
+    return [p["id"] for p in (projects or [])]
+
+
+def check_write_target(args, project: str) -> None:
+    """One rule for every write: it never creates a project unless it
+    targets the git repository the script runs in, or --new-project is set
+    and the id resembles no existing project. The home directory has no
+    default project for writes. Same rule as the TS proxy; the memstate CLI
+    is the human escape for a deliberate near-duplicate. Exits 1 with the
+    way out on stderr; a refusal creates nothing."""
+    if args.new_project and args.scope == "user":
+        raise SystemExit(
+            "Error: --new-project has no effect with --scope user: the user scope always exists")
+    if args.scope == "user":
+        return
+    explicit = bool(args.project)
+    if not explicit:
+        if in_git_repo():
+            if args.new_project:
+                raise SystemExit(
+                    "Error: --new-project has no effect here: the project of the git "
+                    f'repository you are in ("{project}") is created without it')
+            return
+        if is_home_dir():
+            raise SystemExit(
+                "Error: the working directory is your home directory, which has no "
+                "default project for writes. Pass --project ID (an id from "
+                "memstate_get.py --list-projects, or a new id with --new-project), "
+                "or --scope user for facts about this machine")
+    if explicit and project == home_slug_name():
+        raise SystemExit(
+            f'Error: "{project}" is the name of your home directory, which names the user, '
+            "not a project; pass another --project, or --scope user for facts about this machine")
+    ids = list_project_ids()
+    if project in ids:
+        return
+    if explicit:
+        where = f'project "{project}" does not exist'
+    else:
+        where = ("the working directory is not a git repository and its project "
+                 f'"{project}" does not exist')
+    near = near_duplicates(project, ids)
+    if near:
+        listed = ", ".join(f'"{n}"' for n in near)
+        raise SystemExit(
+            f"Error: {where} but looks like existing project {listed}; use "
+            f"--project {near[0]}. To create \"{project}\" as a separate project, "
+            "use the memstate CLI")
+    if not args.new_project:
+        raise SystemExit(
+            f"Error: {where}. Pass --project ID with an id from "
+            "memstate_get.py --list-projects, or add --new-project to create "
+            f'"{project}" (this also revives a soft-deleted project)')
 
 
 def is_other_host(keypath: str) -> bool:

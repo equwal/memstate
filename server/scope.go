@@ -4,15 +4,14 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"regexp"
 	"slices"
 	"strings"
 )
 
 // userProject is the one reserved project. It holds facts about the user
 // and the host that are true in every repository: preferences, profile,
-// environment, tool configuration. The "_" prefix is reserved, so no normal
-// project can take this id.
+// environment, tool configuration. It never collides with a repository
+// slug because slugProject trims edge underscores.
 const userProject = "_user"
 
 // ErrReservedWrite marks a write that the reserved-project gate refused.
@@ -78,16 +77,7 @@ func hostSlug() string {
 	return slugHost(h)
 }
 
-var slugRE = regexp.MustCompile(`[^a-z0-9]+`)
-
-// slugHost lowercases the first hostname label, turns each run of other
-// characters into "_" and trims edge underscores. An empty result becomes
-// "default".
 func slugHost(hostname string) string {
 	label, _, _ := strings.Cut(hostname, ".")
-	s := strings.Trim(slugRE.ReplaceAllString(strings.ToLower(label), "_"), "_")
-	if s == "" {
-		return "default"
-	}
-	return s
+	return slugProject(label)
 }

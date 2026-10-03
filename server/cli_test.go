@@ -55,9 +55,9 @@ func TestResolveCLIProject(t *testing.T) {
 	if _, err := resolveCLIProject(cliOpts{user: true, project: "x"}); err == nil {
 		t.Fatal("--user with --project must be an error")
 	}
-	// The working folder does not name the work, so no flag is an error.
-	if got, err := resolveCLIProject(cliOpts{}); err == nil {
-		t.Fatalf("no --project and no --user must be an error, got %q", got)
+	cwd, _ := os.Getwd()
+	if got, err := resolveCLIProject(cliOpts{}); err != nil || got != deriveProject(cwd) {
+		t.Fatalf("default: %q %v (want %q)", got, err, deriveProject(cwd))
 	}
 }
 

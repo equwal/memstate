@@ -8,12 +8,13 @@ there; see SKILL.md, "User scope".
 import argparse
 import sys
 
-from _client import add_scope_args, post, resolve_project
+from _client import add_scope_args, add_write_args, check_write_target, post, resolve_project
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Set a single fact at a keypath")
     add_scope_args(ap)
+    add_write_args(ap)
     ap.add_argument("--keypath", required=True)
     ap.add_argument("--value", required=True)
     ap.add_argument("--source", default=None)
@@ -23,8 +24,10 @@ def main() -> int:
                     help="comma-separated tags for filtered search")
     args = ap.parse_args()
 
+    project = resolve_project(args)
+    check_write_target(args, project)
     body = {
-        "project_id": resolve_project(args),
+        "project_id": project,
         "keypath": args.keypath,
         "content": args.value,
     }

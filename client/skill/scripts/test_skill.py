@@ -89,11 +89,11 @@ def main():
         expect_key="action", expect_value="created"
     )
 
-    # 4. memstate_get — list all projects
+    # 4. memstate_get — list all projects (no args)
     test(
         "memstate_get: list all projects",
         "memstate_get.py",
-        ["--list-projects"],
+        [],
         expect_key="projects"
     )
 
